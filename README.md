@@ -2,6 +2,8 @@
 
 多平台 IM 客服 **QA 沉淀系统**。收集企业微信、小红书、抖音等平台的客服对话，自动配对成「问题-答案」，人工确认后沉淀为可复用的客服知识库。
 
+[![test](https://github.com/akikazu-pc/omnibot-qa/actions/workflows/test.yml/badge.svg)](https://github.com/akikazu-pc/omnibot-qa/actions/workflows/test.yml)
+
 > 核心价值：**让机器人学会你的说话方式**。不是一次性训练，而是边服务边积累。
 
 ## 它解决什么问题
