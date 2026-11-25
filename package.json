@@ -1,0 +1,31 @@
+{
+  "name": "omnibot-qa",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "多平台 IM 客服 QA 沉淀系统：收集企业微信/小红书/抖音等平台对话，配对成 QA，沉淀为可复用的客服知识库",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "omnibot": "cli.js"
+  },
+  "scripts": {
+    "demo": "node cli.js demo",
+    "pair": "node cli.js pair",
+    "stats": "node cli.js stats",
+    "list": "node cli.js list",
+    "serve": "node server.js",
+    "test": "node --test tests/"
+  },
+  "keywords": [
+    "wecom",
+    "xiaohongshu",
+    "im",
+    "customer-service",
+    "qa",
+    "rag",
+    "knowledge-base"
+  ]
+}
