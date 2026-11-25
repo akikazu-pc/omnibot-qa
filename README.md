@@ -26,10 +26,26 @@
 | 平台 | 接入方式 | 状态 |
 | --- | --- | --- |
 | 企业微信（自建应用） | 官方回调 API + 主动发消息 | ✅ 已支持 |
-| 企业微信（智能机器人） | 官方 API，支持 WS 长连接 | ✅ 收集已支持，自动回复待接 |
+| 企业微信（智能机器人） | 官方 API，WebSocket 长连接 | ✅ 已支持（推荐，无需公网域名） |
 | 小红书（企业专业号） | 聚光平台三方客服 → 开放平台 webhook | ✅ 收集已支持 |
 | 抖音（企业号） | 开放平台私信能力 | 🔜 待认证后接入 |
 | 飞书 / 钉钉 | 预留 | 🔜 |
+
+### 企业微信接入：两条路怎么选
+
+| | 智能机器人（长连接） | 自建应用（回调） |
+| --- | --- | --- |
+| 需要公网域名 | **不需要** | 需要，且要 HTTPS |
+| 需要备案/证书 | 不需要 | 需要 |
+| 拿到凭据 | BotID + Secret | CorpID + AgentId + Secret |
+| 消息加解密 | 不需要 | 需要（AES + SHA1 签名） |
+| 能给外部客户发消息 | 可以 | **不行**，只能发给本企业成员 |
+| 代码 | `adapters/wecom-bot.js` | `adapters/wecom.js` + `wecom-send.js` |
+
+**默认推荐智能机器人**：本机主动外连就能收消息，开发环境零配置。
+
+**如果你的客户是外部微信用户（不是本企业成员）**，只有智能机器人和「微信客服」能触达；
+自建应用发不出消息，那时需要另外接微信客服（`kf` 接口），代码里已留了 `wecom_cs` 平台位。
 
 ### 小红书接入前提
 
@@ -47,6 +63,7 @@
 node cli.js flow       # 完整链路演示：采集→配对→检索→提示词（纯本地，不需要网络）
 node cli.js demo       # 只演示配对逻辑
 node cli.js stats      # 统计
+npm run check          # 检查环境变量配置，告诉你缺什么
 
 # 启动服务
 node server.js         # 默认 127.0.0.1:8787
@@ -64,12 +81,28 @@ export AUTO_REPLY=1                            # 开启自动回复
 node server.js
 ```
 
-再配企业微信凭据才能真正发出去（不配则只落库不发送，方便先观察效果）：
+配好凭据后 `npm run check` 会告诉你还缺什么。
+
+### 接入企业微信智能机器人（推荐）
+
+后台路径：**企业微信管理后台 → 应用管理 → 应用 → 自建 → 创建应用 → 智能机器人**
+（或左下「更多」→ 智能机器人）。建好后拿到 **BotID** 和 **Secret**：
 
 ```bash
-export WECOM_CORP_ID=ww1a2b3c4d5e6f7g8h
-export WECOM_AGENT_ID=1000002
-export WECOM_SECRET=xxx
+export WECOM_BOT_ID=xxxxxxxx
+export WECOM_BOT_SECRET=xxxxxxxx
+export AUTO_REPLY=1
+node server.js
+```
+
+启动后日志出现 `🔌 企业微信智能机器人长连接启动中…` 和 `已连接` 就通了。
+本机主动外连，**不需要公网域名 / 备案 / HTTPS 证书**。
+
+收到消息会走完整链路：
+
+```
+客户发消息 → WS 推送到本机 → 落库 → 检索已审核QA → 抽你的说话风格
+          → 大模型生成 → 同一帧回给客户 → 落库 outbound → 配对出待审核 QA
 ```
 
 ### 先看看 AI 会怎么答（不发送）
@@ -173,7 +206,8 @@ omnibot-qa/
 │   └── store.js        # SQLite 存储
 ├── adapters/
 │   ├── wecom.js        # 企业微信（收）
-│   ├── wecom-send.js   # 企业微信（发，含 token 缓存）
+│   ├── wecom-send.js   # 企业微信自建应用（发，含 token 缓存）
+│   ├── wecom-bot.js    # 企业微信智能机器人（WebSocket 长连接，无需公网域名）
 │   └── xhs.js          # 小红书
 ├── qa/
 │   ├── pair.js         # QA 配对引擎
@@ -183,8 +217,9 @@ omnibot-qa/
 │   └── provider.js     # OpenAI 兼容调用（任何厂商都能接）
 ├── scripts/
 │   ├── demo.js         # 完整链路演示
-│   └── mock-llm.js     # 本地假 LLM，零成本验证
-├── tests/              # 57 个用例
+│   ├── mock-llm.js     # 本地假 LLM，零成本验证
+│   └── setup-check.js  # 配置检查向导
+├── tests/              # 70 个用例
 ├── cli.js
 └── server.js
 ```

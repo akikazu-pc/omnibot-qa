@@ -15,10 +15,12 @@
     "demo": "node cli.js demo",
     "flow": "node scripts/demo.js",
     "mock-llm": "node scripts/mock-llm.js",
+    "check": "node scripts/setup-check.js",
     "pair": "node cli.js pair",
     "stats": "node cli.js stats",
     "list": "node cli.js list",
     "serve": "node server.js",
+    "start": "node server.js",
     "test": "node --test \"tests/**/*.test.js\""
   },
   "keywords": [

@@ -29,6 +29,7 @@ import { pairAll } from './qa/pair.js';
 import { fromWecom, recordOutbound } from './adapters/wecom.js';
 import { sendText, isWecomConfigured } from './adapters/wecom-send.js';
 import { fromXhs, normalizeWebhookBody } from './adapters/xhs.js';
+import { connectBot, isBotConfigured } from './adapters/wecom-bot.js';
 import { createMessage, Direction } from './collector/message.js';
 import { generateReply, isLlmConfigured } from './qa/agent.js';
 
@@ -38,6 +39,8 @@ const SHARED_SECRET = process.env.OMNIBOT_SECRET || '';
 const AUTO_REPLY = process.env.AUTO_REPLY === '1';
 const PERSONA = process.env.BOT_PERSONA || '';
 const BUSINESS = process.env.BOT_BUSINESS || '';
+/** 是否启动企业微信智能机器人长连接 */
+const BOT_WS_ENABLED = process.env.WECOM_BOT_WS === '1' || isBotConfigured();
 
 const store = new Store(DB);
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -165,6 +168,66 @@ async function replyTo({ platform, conversationId, senderId, content, isGroup, c
 
   log(`[auto] → ${senderId} ${gen.text.slice(0, 50)}`);
   return { answer: gen.text, sent: true, references: gen.references.length, usedStyle: gen.usedStyle };
+}
+
+/**
+ * 企业微信智能机器人长连接消息处理。
+ *
+ * 与 HTTP 回调不同：这里的「我方回复」直接通过同一帧回给企业微信，
+ * 不需要额外的发送接口，也不需要 access_token。
+ *
+ * @param {object} raw 已归一化的 raw 结构
+ * @returns {Promise<string>} 要回复给客户的内容（空字符串表示不回复）
+ */
+async function handleBotMessage(raw) {
+  const isGroup = Boolean(raw.ChatId && raw.ChatType === 'group');
+  const conversationId = isGroup ? `group:${raw.ChatId}` : `user:${raw.FromUserName}`;
+  const content = raw.Content || '';
+
+  if (!content) return '';
+
+  const msg = await fromWecom(raw, {
+    platform: 'wecom',
+    resolveUser: async (uid) => {
+      const r = store.db
+        .prepare("SELECT sender_name FROM messages WHERE platform='wecom' AND sender_id=? AND sender_name<>'' LIMIT 1")
+        .get(uid);
+      return r ? { name: r.sender_name } : null;
+    },
+  });
+
+  const added = store.insertMessage(msg);
+  log(`[bot] ${added ? '新' : '重'} ${conversationId} ${content.slice(0, 50)}`);
+
+  if (!added) return ''; // 重复推送，忽略
+  if (!AUTO_REPLY || !isLlmConfigured()) return '';
+
+  try {
+    const gen = await generateReply({
+      question: content,
+      history: store.getConversation('wecom', conversationId, { limit: 20 }),
+      knowledge: loadKnowledge(),
+      styleMessages: loadStyleMessages(),
+      persona: PERSONA || undefined,
+      business: BUSINESS || undefined,
+    });
+
+    // 落库 outbound，供 QA 配对使用
+    store.insertMessage(
+      recordOutbound(isGroup ? raw.ChatId : raw.FromUserName, gen.text, {
+        platform: 'wecom',
+        isGroup,
+        chatId: raw.ChatId,
+        agentId: 'bot',
+      })
+    );
+
+    log(`[bot] ← ${gen.text.slice(0, 50)}`);
+    return gen.text;
+  } catch (err) {
+    log(`[bot] 生成回复失败: ${err.message}`);
+    return '';
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -425,9 +488,38 @@ server.listen(PORT, () => {
   log('─'.repeat(52));
 });
 
+// ---------- 企业微信智能机器人长连接 ----------
+let botClient = null;
+if (BOT_WS_ENABLED) {
+  if (!isBotConfigured()) {
+    log('⚠️  企业微信长连接：未配置 WECOM_BOT_ID / WECOM_BOT_SECRET，跳过');
+  } else {
+    log('🔌 企业微信智能机器人长连接启动中…');
+    botClient = connectBot({
+      onMessage: handleBotMessage,
+      onState: (state, detail) => {
+        const label = {
+          connecting: '连接中',
+          connected: '已连接',
+          reconnecting: `重连中（${detail?.delay ?? 0}ms 后）`,
+          error: `出错：${detail?.error ?? ''}`,
+          closed: '已关闭',
+          idle: '待机',
+        }[state] || state;
+        log(`[ws] ${label}`);
+      },
+    });
+  }
+}
+
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     log('关闭中…');
+    try {
+      botClient?.close();
+    } catch {
+      /* 忽略 */
+    }
     server.close(() => {
       store.close();
       process.exit(0);
