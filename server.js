@@ -1,17 +1,22 @@
 #!/usr/bin/env node
 /**
- * omnibot-qa 收集服务
+ * omnibot-qa 服务
  *
- * 提供 webhook 入口，接收各平台回调，归一化后落库。
- * 只做「收集」，不做自动回复 —— 回复由 LangBot 负责，
- * 但回复内容需要通过 /api/reply 回报给本服务，才能配出 QA。
+ * 一条完整链路：收到客户消息 → 落库 → AI 生成回复 → 发回客户 → 落库 → 配对 QA。
+ *
+ * 两种运行模式：
+ * 1. 收集模式（默认）：只收集，回复由人工或外部系统负责，通过 /api/reply 回报
+ * 2. 自动回复模式（AUTO_REPLY=1）：收到消息后自动用 AI 回复，回复内容自动落库
+ *    需要配置 OPENAI_API_KEY（+ 企业微信凭据才能真发出去）
  *
  * 路由：
  *   GET  /health                 健康检查
  *   POST /hook/wecom             企业微信自建应用回调
  *   POST /hook/wecombot          企业微信智能机器人回调
  *   POST /hook/xhs               小红书回调
+ *   POST /api/message            通用消息入口（平台无关，供外部插件调用）
  *   POST /api/reply              回报我方发出的消息（配对答案的关键）
+ *   POST /api/ask                AI 生成一条回复但不发送（调试/预览用）
  *   GET  /api/stats              统计
  *   GET  /api/qa                 列出 QA
  *   POST /api/qa/:id/approve     确认
@@ -22,11 +27,17 @@ import http from 'node:http';
 import { Store } from './collector/store.js';
 import { pairAll } from './qa/pair.js';
 import { fromWecom, recordOutbound } from './adapters/wecom.js';
+import { sendText, isWecomConfigured } from './adapters/wecom-send.js';
 import { fromXhs, normalizeWebhookBody } from './adapters/xhs.js';
+import { createMessage, Direction } from './collector/message.js';
+import { generateReply, isLlmConfigured } from './qa/agent.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const DB = process.env.OMNIBOT_DB || 'data/omnibot.db';
 const SHARED_SECRET = process.env.OMNIBOT_SECRET || '';
+const AUTO_REPLY = process.env.AUTO_REPLY === '1';
+const PERSONA = process.env.BOT_PERSONA || '';
+const BUSINESS = process.env.BOT_BUSINESS || '';
 
 const store = new Store(DB);
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -58,6 +69,102 @@ function json(res, status, obj) {
 function authorized(req) {
   if (!SHARED_SECRET) return true;
   return req.headers['x-omnibot-secret'] === SHARED_SECRET;
+}
+
+/** 取全部已审核 QA 作为知识库（每次现取，保证审核后立即生效） */
+function loadKnowledge() {
+  return store.listQa({ status: 'approved', limit: 5000 });
+}
+
+/** 取最近的历史回复作为风格样本来源 */
+function loadStyleMessages(limit = 300) {
+  return store.db
+    .prepare(`SELECT * FROM messages WHERE direction = 'outbound' ORDER BY timestamp DESC LIMIT ?`)
+    .all(limit);
+}
+
+/**
+ * 客户提问 → AI 回复 → 落库 → 发送。
+ *
+ * @param {Object} p
+ * @param {string} p.platform
+ * @param {string} p.conversationId
+ * @param {string} p.senderId
+ * @param {string} p.content
+ * @param {boolean} [p.isGroup]
+ * @param {string} [p.chatId]
+ * @param {string} [p.agentId]
+ * @param {boolean} [p.dryRun] 只生成不发送
+ * @returns {Promise<{answer:string, sent:boolean, error?:string, references:number, usedStyle:number}>}
+ */
+async function replyTo({ platform, conversationId, senderId, content, isGroup, chatId, agentId, dryRun }) {
+  if (!isLlmConfigured()) {
+    throw new Error('LLM 未配置：请设置 OPENAI_API_KEY（及可选 OPENAI_BASE_URL / OPENAI_MODEL）');
+  }
+
+  const history = store.getConversation(platform, conversationId, { limit: 20 });
+
+  const gen = await generateReply({
+    question: content,
+    history,
+    knowledge: loadKnowledge(),
+    styleMessages: loadStyleMessages(),
+    persona: PERSONA || undefined,
+    business: BUSINESS || undefined,
+  });
+
+  // 无论是否发送成功，都先落库，避免 QA 配对丢答案
+  const outbound = recordOutbound(isGroup ? chatId : senderId, gen.text, {
+    platform,
+    isGroup,
+    chatId,
+    agentId,
+  });
+  store.insertMessage(outbound);
+
+  if (dryRun) {
+    return { answer: gen.text, sent: false, references: gen.references.length, usedStyle: gen.usedStyle };
+  }
+
+  // 目前只有企业微信有发送实现
+  if (platform !== 'wecom') {
+    return {
+      answer: gen.text,
+      sent: false,
+      error: `${platform} 暂未实现自动发送，回复已落库`,
+      references: gen.references.length,
+      usedStyle: gen.usedStyle,
+    };
+  }
+
+  if (isGroup) {
+    // 群聊场景：群机器人接口不同，先只落库不发送
+    return {
+      answer: gen.text,
+      sent: false,
+      error: '群聊自动回复暂未支持，回复已落库',
+      references: gen.references.length,
+      usedStyle: gen.usedStyle,
+    };
+  }
+
+  if (!isWecomConfigured()) {
+    return {
+      answer: gen.text,
+      sent: false,
+      error: '企业微信凭据未配置，回复已落库但未发送',
+      references: gen.references.length,
+      usedStyle: gen.usedStyle,
+    };
+  }
+
+  const r = await sendText({ toUser: senderId, content: gen.text });
+  if (!r.ok) {
+    return { answer: gen.text, sent: false, error: r.error, references: gen.references.length, usedStyle: gen.usedStyle };
+  }
+
+  log(`[auto] → ${senderId} ${gen.text.slice(0, 50)}`);
+  return { answer: gen.text, sent: true, references: gen.references.length, usedStyle: gen.usedStyle };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -96,7 +203,26 @@ const server = http.createServer(async (req, res) => {
 
       const added = store.insertMessage(msg);
       log(`[wecom] ${added ? '新增' : '已存在'} ${msg.conversation_id} ${msg.content.slice(0, 50)}`);
-      return json(res, 200, { ok: true, added });
+
+      // 自动回复：仅在新增消息、且开启 AUTO_REPLY 时触发，避免平台重试导致重复回复
+      let reply;
+      if (AUTO_REPLY && added && msg.msg_type === 'text' && msg.content) {
+        try {
+          reply = await replyTo({
+            platform: 'wecom',
+            conversationId: msg.conversation_id,
+            senderId: msg.sender_id,
+            content: msg.content,
+            isGroup: msg.is_group,
+            chatId: msg.is_group ? msg.conversation_id.replace(/^group:/, '') : undefined,
+          });
+        } catch (e) {
+          log('❌ 自动回复失败:', e.message);
+          reply = { error: e.message };
+        }
+      }
+
+      return json(res, 200, { ok: true, added, ...(reply ? { reply } : {}) });
     }
 
     // ---------- 小红书 ----------
@@ -124,6 +250,69 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, received: items.length, added: n });
     }
 
+    // ---------- 通用消息入口（LangBot 插件使用）----------
+    // 平台无关：插件把归一化后的字段直接 POST 过来，落库后统一配对。
+    if (path === '/api/message' && req.method === 'POST') {
+      if (!authorized(req)) return json(res, 401, { error: 'unauthorized' });
+      const b = JSON.parse(await readBody(req));
+      const {
+        platform = 'wecom',
+        conversation_id,
+        sender_id,
+        sender_name = '',
+        direction = 'inbound',
+        content = '',
+        timestamp,
+        is_group = false,
+        msg_type = 'text',
+      } = b;
+
+      if (!conversation_id || !sender_id) {
+        return json(res, 400, { error: 'conversation_id 和 sender_id 必填' });
+      }
+
+      const msg = createMessage({
+        id: `${platform}:${conversation_id}:${direction}:${timestamp || Date.now()}:${Math.random()
+          .toString(36)
+          .slice(2, 8)}`,
+        platform,
+        conversation_id,
+        sender_id,
+        sender_name,
+        direction,
+        msg_type,
+        content,
+        timestamp: Number(timestamp) || Date.now(),
+        is_group: Boolean(is_group),
+        raw: b.reply_to ? { reply_to: b.reply_to } : undefined,
+      });
+
+      const added = store.insertMessage(msg);
+      if (added) {
+        log(`[msg] ${direction === 'outbound' ? '答' : '问'} ${conversation_id} ${String(content).slice(0, 50)}`);
+      }
+
+      let reply;
+      if (AUTO_REPLY && added && direction === 'inbound' && msg_type === 'text' && content) {
+        try {
+          reply = await replyTo({
+            platform,
+            conversationId: conversation_id,
+            senderId: sender_id,
+            content,
+            isGroup: Boolean(is_group),
+            chatId: b.chat_id,
+            agentId: b.agent_id,
+          });
+        } catch (e) {
+          log('❌ 自动回复失败:', e.message);
+          reply = { error: e.message };
+        }
+      }
+
+      return json(res, 200, { ok: true, added, ...(reply ? { reply } : {}) });
+    }
+
     // ---------- 回报我方发出的消息 ----------
     if (path === '/api/reply' && req.method === 'POST') {
       if (!authorized(req)) return json(res, 401, { error: 'unauthorized' });
@@ -140,6 +329,31 @@ const server = http.createServer(async (req, res) => {
       store.insertMessage(msg);
       log(`[reply] ${msg.conversation_id} ${content.slice(0, 50)}`);
       return json(res, 200, { ok: true, id: msg.id });
+    }
+
+    // ---------- 只生成不发送（调试/预览）----------
+    if (path === '/api/ask' && req.method === 'POST') {
+      if (!authorized(req)) return json(res, 401, { error: 'unauthorized' });
+      const b = JSON.parse(await readBody(req));
+      const { question, platform = 'wecom', conversation_id } = b;
+      if (!question) return json(res, 400, { error: 'question 必填' });
+
+      const history = conversation_id ? store.getConversation(platform, conversation_id, { limit: 20 }) : [];
+      const gen = await generateReply({
+        question,
+        history,
+        knowledge: loadKnowledge(),
+        styleMessages: loadStyleMessages(),
+        persona: PERSONA || undefined,
+        business: BUSINESS || undefined,
+      });
+
+      return json(res, 200, {
+        answer: gen.text,
+        references: gen.references.map((r) => ({ question: r.doc.question, score: Number(r.score.toFixed(3)) })),
+        usedStyle: gen.usedStyle,
+        usage: gen.usage,
+      });
     }
 
     // ---------- 查询与审核 ----------
@@ -198,12 +412,17 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  log('─'.repeat(48));
-  log(`📥 omnibot-qa 收集服务  http://127.0.0.1:${PORT}`);
+  log('─'.repeat(52));
+  log(`📥 omnibot-qa 服务  http://127.0.0.1:${PORT}`);
   log(`   数据库: ${DB}`);
-  log(`   鉴权: ${SHARED_SECRET ? '已启用' : '未启用（建议生产环境配置 OMNIBOT_SECRET）'}`);
-  log('   回调入口: /hook/wecom  /hook/wecombot  /hook/xhs');
-  log('─'.repeat(48));
+  log(`   鉴权: ${SHARED_SECRET ? '已启用' : '未启用（生产环境建议配置 OMNIBOT_SECRET）'}`);
+  log(`   模式: ${AUTO_REPLY ? '🤖 自动回复' : '📦 仅收集'}`);
+  if (AUTO_REPLY) {
+    log(`   LLM: ${isLlmConfigured() ? '✅ 已配置' : '❌ 未配置（设置 OPENAI_API_KEY）'}`);
+    log(`   企业微信发送: ${isWecomConfigured() ? '✅ 已配置' : '❌ 未配置（回复只落库不发送）'}`);
+  }
+  log('   回调入口: /hook/wecom  /hook/wecombot  /hook/xhs  /api/message');
+  log('─'.repeat(52));
 });
 
 for (const sig of ['SIGINT', 'SIGTERM']) {

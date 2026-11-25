@@ -117,6 +117,12 @@ function main() {
       break;
     }
 
+    case 'flow': {
+      // 完整链路演示：采集 → 配对 → 检索 → 组装 prompt
+      store.close();
+      return import('./scripts/demo.js');
+    }
+
     default:
       console.log(`omnibot-qa — 多平台客服 QA 沉淀工具
 
@@ -126,7 +132,8 @@ function main() {
   reject <id> [原因]       驳回
   stats                    统计
   export [--out file]      导出已确认 QA 为 JSONL
-  demo                     跑一遍演示数据
+  demo                     跑一遍配对逻辑演示
+  flow                     跑完整链路演示（采集→配对→检索→提示词）
 `);
   }
 
