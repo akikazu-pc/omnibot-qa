@@ -47,6 +47,9 @@
 **如果你的客户是外部微信用户（不是本企业成员）**，只有智能机器人和「微信客服」能触达；
 自建应用发不出消息，那时需要另外接微信客服（`kf` 接口），代码里已留了 `wecom_cs` 平台位。
 
+> 自建应用什么时候还有用？① 给内部同事做测试环境；② 调通讯录/部门接口做客户档案补全。
+> 但**它不能作为对外客服的通道**，这是 API 层面的硬约束，不是配置问题。
+
 ### 小红书接入前提
 
 1. 企业专业号认证
@@ -83,27 +86,59 @@ node server.js
 
 配好凭据后 `npm run check` 会告诉你还缺什么。
 
-### 接入企业微信智能机器人（推荐）
+### 接入企业微信智能机器人（推荐，能对接外部客户）
 
-后台路径：**企业微信管理后台 → 应用管理 → 应用 → 自建 → 创建应用 → 智能机器人**
-（或左下「更多」→ 智能机器人）。建好后拿到 **BotID** 和 **Secret**：
+> **为什么必须用它**：企业微信「自建应用」的消息 API 只接受**本企业通讯录内的 userid**，
+> 发不到外部客户。要对外部客户做客服，只有智能机器人和微信客服能触达。
+
+**后台配置四步**：
+
+1. 企业微信管理后台 → **应用管理 → 应用 → 自建 → 「+ 创建应用」**
+   （「消息推送」不行，它没有 API 权限）
+2. 应用类型选 **智能机器人**，填名称，创建
+3. 进入机器人详情 → 开启 **「API 模式」** → 选择 **「长连接」** 方式
+   （⚠️ 只能在「长连接」和「回调地址」里二选一，切到回调地址会让现有长连接立即失效）
+4. 复制 **BotID** 和 **Secret**（这是长连接专用 Secret，不是 Token/EncodingAESKey）
 
 ```bash
-export WECOM_BOT_ID=xxxxxxxx
-export WECOM_BOT_SECRET=xxxxxxxx
+export WECOM_BOT_ID=你的BotID
+export WECOM_BOT_SECRET=你的Secret
+export OPENAI_API_KEY=sk-xxx
 export AUTO_REPLY=1
 node server.js
 ```
 
-启动后日志出现 `🔌 企业微信智能机器人长连接启动中…` 和 `已连接` 就通了。
-本机主动外连，**不需要公网域名 / 备案 / HTTPS 证书**。
+启动后日志应该长这样：
+
+```
+🔌 企业微信智能机器人长连接启动中…
+[ws] 连接中
+[ws] 握手鉴权中
+[ws] ✅ 已连接
+```
+
+看到 `✅ 已连接` 说明订阅成功。本机主动外连 `wss://openws.work.weixin.qq.com`，
+**不需要公网域名 / 备案 / HTTPS 证书 / 消息加解密**。
 
 收到消息会走完整链路：
 
 ```
-客户发消息 → WS 推送到本机 → 落库 → 检索已审核QA → 抽你的说话风格
-          → 大模型生成 → 同一帧回给客户 → 落库 outbound → 配对出待审核 QA
+客户发消息 → WS 推送 → 落库 → 检索已审核QA → 抽你的说话风格
+          → 大模型生成 → aibot_respond_msg 回帧 → 落库 outbound → 配对出待审核 QA
 ```
+
+**协议细节**（按官方 SDK `@wecom/aibot-node-sdk` 实现，不是猜的）：
+
+| 动作 | cmd | 说明 |
+| --- | --- | --- |
+| 鉴权 | `aibot_subscribe` | `body: { bot_id, secret }` |
+| 心跳 | `ping` | 建议 30 秒 |
+| 收消息 | `aibot_msg_callback` | `body.msgtype` / `from.userid` / `text.content` |
+| 回复 | `aibot_respond_msg` | `body: { msgtype:'stream', stream:{ id, finish, content } }` |
+| 主动推送 | `aibot_send_msg` | 无需用户先说话 |
+
+**注意**：同一机器人**同时只能有一个长连接**，新连接会踢掉旧连接。
+本地调试时别在多个终端同时跑。
 
 ### 先看看 AI 会怎么答（不发送）
 
@@ -117,7 +152,15 @@ curl -X POST http://127.0.0.1:8787/api/ask \
 
 ### 本地零成本试用
 
-不想花额度也能验证链路 —— 内置一个假的 OpenAI 兼容服务：
+不需要真实凭据也不花钱 —— 直接跑端到端验证（模拟企业微信推送）：
+
+```bash
+node scripts/e2e-bot.js
+```
+
+它会用假 WebSocket 走完：订阅鉴权 → 收到消息 → AI 生成 → stream 回帧 → 落库 → 配对 QA。
+
+或者起个假 LLM 配真服务：
 
 ```bash
 node scripts/mock-llm.js 8899     # 终端 1

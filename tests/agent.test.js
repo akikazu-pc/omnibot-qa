@@ -114,10 +114,12 @@ describe('agent: buildSystemPrompt', () => {
     assert.match(p, /这个我们支持的/);
   });
 
-  test('无参考时不出现空段落', () => {
+  test('无参考时明确告知模型没有事实依据', () => {
     const p = buildSystemPrompt({});
-    assert.ok(!p.includes('过往真实问答'));
-    assert.ok(!p.includes('你的说话风格'));
+    // 不再出现问答段落，但要明确提示"没有可依据的事实"，防止模型乱编
+    assert.ok(!p.includes('客户问：'), '无参考时不应出现问答条目');
+    assert.ok(p.includes('没有检索到相关问答'), '应明确告知无依据');
+    assert.ok(!p.includes('你的说话风格'), '无样本时不应出现风格段落');
   });
 });
 

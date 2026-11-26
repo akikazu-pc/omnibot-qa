@@ -497,14 +497,19 @@ if (BOT_WS_ENABLED) {
     log('🔌 企业微信智能机器人长连接启动中…');
     botClient = connectBot({
       onMessage: handleBotMessage,
+      onEvent: (body, ctx) => {
+        // 用户首次进入会话，可用来发欢迎语（这里只记日志）
+        log(`[ws] 事件 ${body.event_type || '(未知)'} from=${body.from?.userid || '-'} req=${ctx.reqId}`);
+      },
       onState: (state, detail) => {
         const label = {
-          connecting: '连接中',
-          connected: '已连接',
-          reconnecting: `重连中（${detail?.delay ?? 0}ms 后）`,
-          error: `出错：${detail?.error ?? ''}`,
-          closed: '已关闭',
           idle: '待机',
+          connecting: '连接中',
+          handshaking: '握手鉴权中',
+          connected: '✅ 已连接',
+          reconnecting: `重连中（${detail?.delay ?? 0}ms 后，${detail?.reason || ''}）`,
+          error: `❌ 出错：${detail?.error ?? ''}`,
+          closed: '已关闭',
         }[state] || state;
         log(`[ws] ${label}`);
       },
