@@ -213,6 +213,11 @@ node cli.js stats                     # 统计
 node cli.js export --out qa.jsonl     # 导出已确认 QA
 node cli.js import chat.txt --self 小王 # 导入粘贴的聊天记录（--dry 只预览）
 node cli.js flow                      # 完整链路演示
+
+# 话术库
+node scripts/setup-snippets.js init   # 交互式生成 data/snippets.json
+node scripts/setup-snippets.js lint   # 检查折行 / 配置错误 / 关键词冲突
+node scripts/setup-snippets.js try "多少钱"  # 模拟客户提问看命中哪条
 ```
 
 ## HTTP 接口
@@ -226,6 +231,7 @@ node cli.js flow                      # 完整链路演示
 | POST | `/api/reply` | **回报我方发出的消息**（配对答案的关键） |
 | POST | `/api/import` | 粘贴导入聊天记录（`{"text":"...","self_name":"小王"}`） |
 | POST | `/api/ask` | AI 生成一条回复但不发送（调优用） |
+| POST | `/api/snippet` | 预览话术匹配结果（不发送、不需要模型 key） |
 | POST | `/api/pair` | 手动触发配对 |
 | GET | `/api/qa?status=pending` | 列出 QA |
 | POST | `/api/qa/:id/approve` | 确认 |
@@ -292,7 +298,9 @@ omnibot-qa/
 ├── qa/
 │   ├── pair.js         # QA 配对引擎
 │   ├── knowledge.js    # BM25 检索（中文 bigram，零依赖）
-│   └── agent.js        # 风格抽取 + prompt 组装 + 生成回复
+│   ├── agent.js        # 风格抽取 + prompt 组装 + 生成回复
+│   ├── snippets.js     # 话术匹配（问句判定 + 优先级 + 负面词）
+│   └── card.js         # 卡片渲染 + 手机端宽度检测
 ├── llm/
 │   └── provider.js     # OpenAI 兼容调用（任何厂商都能接）
 ├── scripts/
@@ -300,11 +308,89 @@ omnibot-qa/
 │   ├── e2e-bot.js      # 智能机器人端到端（假 WS + 假 LLM）
 │   ├── e2e-import.js   # 粘贴导入端到端（导入→配对→检索→草稿）
 │   ├── mock-llm.js     # 本地假 LLM，零成本验证
+│   ├── make-card.js    # 卡片渲染 CLI
+│   ├── setup-snippets.js # 话术库向导（init / lint / try）
 │   └── setup-check.js  # 配置检查向导
-├── tests/              # 157 个用例
+├── data/
+│   ├── snippets.example.json # 话术模板（跟着仓库走）
+│   └── snippets.json         # 你的实际话术（本地，不进仓库）
+├── tests/              # 191 个用例
 ├── cli.js
 └── server.js
 ```
+
+## 话术库：报价这类内容不要交给 AI
+
+AI 适合答「你们支持私有化吗」，不适合答「多少钱」。
+
+原因很直接：报价、发票、试用、联系方式这些是**承诺**。模型多写一句
+「老客户可以再谈」，你就多一笔扯不清的账。所以这类问题的正确答案不是
+生成，而是**原样发出去**。
+
+`data/snippets.json` 就是这个「原样发出去」的库。命中关键词 → 直发固定文案，
+**不调用模型、不消耗 token、不需要 `OPENAI_API_KEY`**，零延迟零幻觉。
+
+### 怎么配
+
+```bash
+cp data/snippets.example.json data/snippets.json   # 从模板开始
+
+node scripts/setup-snippets.js init                # 交互式向导：问套餐/单价/优惠/电话
+node scripts/setup-snippets.js lint                # 检查排版折行 + 配置错误 + 关键词冲突
+node scripts/setup-snippets.js try "多少钱"         # 模拟客户提问，看命中哪条
+```
+
+改完重启服务生效。
+
+### 一句话话术长这样
+
+```json
+{
+  "id": "price",
+  "label": "报价",
+  "priority": 100,
+  "keywords": ["多少钱", "什么价", "报价", "怎么收费"],
+  "negative": ["便宜", "太贵", "划算", "性价比"],
+  "exclude": ["模板", "表格", "excel"],
+  "reply": "🎯 产品报价\n\n📦 基础版\n   💰 2980 元 / 年\n   · 10 个账号\n..."
+}
+```
+
+| 字段 | 作用 |
+| --- | --- |
+| `keywords` | 客户话里出现任一个就触发 |
+| `priority` | 多条同时命中时，数字大的赢 |
+| `negative` | 出现这些词就**不**触发（「太贵了」不该甩价格表） |
+| `exclude` | 话题不符就不触发（客户问「有价格表模板吗」不是在问价） |
+| `requireQuestion` | 默认 `true`，必须像提问才触发；写 `false` 则无条件触发 |
+
+### 两道闸，防止乱发价格
+
+1. **问句判定（`looksLikeAsk`）** —— 微信里绝大多数提问根本没有问号，
+   所以靠疑问词判断（多少钱/能不能/有没有/怎么…）。纯寒暄「你好」「谢谢」直接放行不触发。
+2. **语义判负（`isPriceComplaint`）** —— 「价格好高」形式上像提问，实际是嫌贵。
+   这种时候甩一张价格表等于火上浇油，所以报价话术一律让开，交给 AI 或人工。
+
+### 关于「直接发价格表网页链接」
+
+企业微信**智能机器人单聊里发不出可点链接** —— markdown 的 `a` 标签只在群聊渲染，
+单聊会被降级成纯文本。所以「问价 → 甩个网页过去」这条路走不通。
+
+替代方案就是上面这种**卡片式文本**：用 emoji 当视觉分隔、按 34 个半角宽度排版
+（企微手机端一行大约就这么宽），在聊天窗口里看起来就是一张图。
+`lint` 会逐行算宽度，超了会告诉你哪一行会折行。
+
+真要给链接，就把链接当成纯文本放在卡片末尾，让客户自己长按复制。
+
+### 在线预览卡片
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/snippet \
+  -H "Content-Type: application/json" \
+  -d '{"text":"你们这个多少钱"}'
+```
+
+返回命中的是哪条、完整文案、以及最宽行是多少，不发送、不需要模型 key。
 
 ## 自动回复是怎么模仿你的
 
@@ -362,7 +448,7 @@ omnibot-qa/
 ## 测试
 
 ```bash
-npm test                          # 157 个用例，纯本地，不联网
+npm test                          # 191 个用例，纯本地，不联网
 node scripts/e2e-import.js        # 粘贴导入全链路（假 LLM，验证结构）
 OPENAI_API_KEY=sk-xx node scripts/e2e-import.js --live   # 用真模型看草稿质量
 ```

@@ -25,6 +25,8 @@
  *   GET  /api/export             导出已确认 QA（JSONL）
  */
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
 import { Store } from './collector/store.js';
 import { pairAll } from './qa/pair.js';
 import { fromWecom, recordOutbound } from './adapters/wecom.js';
@@ -34,6 +36,8 @@ import { connectBot, isBotConfigured } from './adapters/wecom-bot.js';
 import { parsePastedChat, importMessages } from './adapters/paste.js';
 import { createMessage, Direction } from './collector/message.js';
 import { generateReply, isLlmConfigured } from './qa/agent.js';
+import { matchSnippet, validateSnippets } from './qa/snippets.js';
+import { checkCardWidth } from './qa/card.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const DB = process.env.OMNIBOT_DB || 'data/omnibot.db';
@@ -43,9 +47,33 @@ const PERSONA = process.env.BOT_PERSONA || '';
 const BUSINESS = process.env.BOT_BUSINESS || '';
 /** 是否启动企业微信智能机器人长连接 */
 const BOT_WS_ENABLED = process.env.WECOM_BOT_WS === '1' || isBotConfigured();
+/** 话术库文件（报价、发票这类必须一字不差的回复） */
+const SNIPPETS_FILE = process.env.OMNIBOT_SNIPPETS || 'data/snippets.json';
 
 const store = new Store(DB);
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+/**
+ * 加载话术库。文件不存在就返回空数组（不报错），
+ * 这样没配话术的人跟以前行为完全一致。
+ */
+function loadSnippets() {
+  try {
+    const raw = fs.readFileSync(path.resolve(SNIPPETS_FILE), 'utf8');
+    const obj = JSON.parse(raw);
+    const list = Array.isArray(obj) ? obj : obj.snippets || [];
+    const problems = validateSnippets(list);
+    if (problems.length) {
+      log('⚠️  话术库有问题，已忽略：');
+      for (const p of problems) log(`     ${p}`);
+      return [];
+    }
+    return list;
+  } catch (err) {
+    if (err.code !== 'ENOENT') log(`⚠️  读取话术库失败：${err.message}`);
+    return [];
+  }
+}
 
 function readBody(req, limit = 2_000_000) {
   return new Promise((resolve, reject) => {
@@ -103,11 +131,51 @@ function loadStyleMessages(limit = 300) {
  * @returns {Promise<{answer:string, sent:boolean, error?:string, references:number, usedStyle:number}>}
  */
 async function replyTo({ platform, conversationId, senderId, content, isGroup, chatId, agentId, dryRun }) {
+  const history = store.getConversation(platform, conversationId, { limit: 20 });
+
+  // ── 第一步：话术库优先 ──────────────────────────────
+  // 报价、发票、试用这类回复必须一字不差，绝不能让模型改写。
+  // 命中就直接发，不调模型：零延迟、零成本、不会编出根本不存在的价格。
+  const hit = matchSnippet(content, loadSnippets());
+  if (hit) {
+    log(`[snippet] 命中「${hit.label || hit.id}」→ 直接回复`);
+    const outbound = recordOutbound(isGroup ? chatId : senderId, hit.reply, {
+      platform,
+      isGroup,
+      chatId,
+      agentId,
+    });
+    store.insertMessage(outbound);
+
+    if (dryRun) {
+      return { answer: hit.reply, sent: false, references: 0, usedStyle: 0, snippet: hit.id };
+    }
+    if (platform !== 'wecom' || isGroup || !isWecomConfigured()) {
+      return {
+        answer: hit.reply,
+        sent: false,
+        references: 0,
+        usedStyle: 0,
+        snippet: hit.id,
+        error: '话术已生成并落库，但当前无法自动发送（需自建应用凭据且非群聊）',
+      };
+    }
+    const r = await sendText({ toUser: senderId, content: hit.reply });
+    log(`[snippet] → ${senderId} ${hit.reply.slice(0, 40)}`);
+    return {
+      answer: hit.reply,
+      sent: Boolean(r.ok),
+      references: 0,
+      usedStyle: 0,
+      snippet: hit.id,
+      ...(r.ok ? {} : { error: r.error }),
+    };
+  }
+
+  // ── 第二步：没有话术就交给模型 ──────────────────────
   if (!isLlmConfigured()) {
     throw new Error('LLM 未配置：请设置 OPENAI_API_KEY（及可选 OPENAI_BASE_URL / OPENAI_MODEL）');
   }
-
-  const history = store.getConversation(platform, conversationId, { limit: 20 });
 
   const gen = await generateReply({
     question: content,
@@ -202,7 +270,24 @@ async function handleBotMessage(raw) {
   log(`[bot] ${added ? '新' : '重'} ${conversationId} ${content.slice(0, 50)}`);
 
   if (!added) return ''; // 重复推送，忽略
-  if (!AUTO_REPLY || !isLlmConfigured()) return '';
+  if (!AUTO_REPLY) return '';
+
+  // 话术优先：报价、发票这类必须一字不差，而且不需要 LLM 也能跑
+  const hit = matchSnippet(content, loadSnippets());
+  if (hit) {
+    log(`[bot] 话术命中「${hit.label || hit.id}」`);
+    store.insertMessage(
+      recordOutbound(isGroup ? raw.ChatId : raw.FromUserName, hit.reply, {
+        platform: 'wecom',
+        isGroup,
+        chatId: raw.ChatId,
+        agentId: 'bot',
+      })
+    );
+    return hit.reply;
+  }
+
+  if (!isLlmConfigured()) return '';
 
   try {
     const gen = await generateReply({
@@ -412,6 +497,29 @@ const server = http.createServer(async (req, res) => {
       if (!question) return json(res, 400, { error: 'question 必填' });
 
       const history = conversation_id ? store.getConversation(platform, conversation_id, { limit: 20 }) : [];
+
+      // 话术优先，和真实回复路径保持同一套逻辑，这样预览所见即所得
+      const hit = matchSnippet(question, loadSnippets());
+      if (hit) {
+        return json(res, 200, {
+          answer: hit.reply,
+          source: 'snippet',
+          snippet: { id: hit.id, label: hit.label || hit.id },
+          references: [],
+          usedStyle: 0,
+          usage: null,
+        });
+      }
+
+      // 未命中话术，要交给模型。没配 key 就直接告诉他，别等抛错变成 500。
+      if (!isLlmConfigured()) {
+        return json(res, 400, {
+          error: '这条没命中任何话术，需要走 AI，但 OPENAI_API_KEY 未配置',
+          hint: '要么在 data/snippets.json 里加一条对应话术，要么配置 OPENAI_API_KEY',
+          matched: false,
+        });
+      }
+
       const gen = await generateReply({
         question,
         history,
@@ -423,9 +531,32 @@ const server = http.createServer(async (req, res) => {
 
       return json(res, 200, {
         answer: gen.text,
+        source: 'llm',
         references: gen.references.map((r) => ({ question: r.doc.question, score: Number(r.score.toFixed(3)) })),
         usedStyle: gen.usedStyle,
         usage: gen.usage,
+      });
+    }
+
+    // ---------- 话术预览（不需要 LLM key）----------
+    // 客户问一句，看会命中哪条话术；命中就返回渲染好的卡片文本。
+    // 用来调关键词，改完 data/snippets.json 重启即可。
+    if (path === '/api/snippet' && req.method === 'POST') {
+      if (!authorized(req)) return json(res, 401, { error: 'unauthorized' });
+      const b = JSON.parse(await readBody(req));
+      const { text } = b;
+      if (!text) return json(res, 400, { error: 'text 必填' });
+
+      const all = loadSnippets();
+      const hit = matchSnippet(text, all);
+      const width = hit ? checkCardWidth(hit.reply, 34) : null;
+
+      return json(res, 200, {
+        text,
+        matched: Boolean(hit),
+        snippet: hit ? { id: hit.id, label: hit.label || hit.id, reply: hit.reply } : null,
+        width: width ? { maxWidth: width.maxWidth, over: width.over } : null,
+        total: all.length,
       });
     }
 
