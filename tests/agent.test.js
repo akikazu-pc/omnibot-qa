@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { tokenize, search } from '../qa/knowledge.js';
+import { tokenize, search, hasMandatoryHits } from '../qa/knowledge.js';
 import { collectStyleSamples, buildSystemPrompt, generateReply } from '../qa/agent.js';
 import { chat, loadLlmConfig, isLlmConfigured } from '../llm/provider.js';
 import { Direction, createMessage } from '../collector/message.js';
@@ -54,6 +54,50 @@ describe('keyword: search', () => {
   test('空文档集不报错', () => {
     assert.deepEqual(search('测试', []), []);
     assert.deepEqual(search('测试', null), []);
+  });
+
+  // 以下是「宁可不答也不能答错」的护栏，客服场景最重要的性质
+  describe('必备词校验（防瞎答）', () => {
+    const kb = [
+      { question: '你们私有化部署支持国产化环境吗', answer: '支持，麒麟、统信、达梦都适配过' },
+      { question: '你们支持私有化部署吗', answer: '支持的，可以部署到你们自己服务器' },
+      { question: '价格怎么算', answer: '按年付费，基础版 9999 一年' },
+    ];
+
+    test('关键信息不重合时必须拒答，不能拿「国产化」的答案回「多少钱」', () => {
+      const r = search('私有化多少钱', kb);
+      assert.equal(r.length, 0, '共有词「私有化」不足以支撑作答');
+    });
+
+    test('只问价格时命中价格那条', () => {
+      const r = search('价格怎么算', kb);
+      assert.ok(r.length > 0);
+      assert.match(r[0].doc.question, /价格/);
+    });
+
+    test('问题与知识库里的话几乎一致时稳定命中', () => {
+      const r = search('你们支持私有化部署吗', kb);
+      assert.ok(r.length > 0);
+      assert.match(r[0].doc.question, /私有化/);
+    });
+
+    test('完全无关的问题一定拒答', () => {
+      for (const q of ['你们老板叫什么', '能开专票吗', '今天营业吗']) {
+        assert.equal(search(q, kb).length, 0, `${q} 不该命中`);
+      }
+    });
+
+    test('hasMandatoryHits: 全是常见词时不做限制', () => {
+      const df = new Map([['私有', 3]]);
+      const tf = new Map([['私有', 1]]);
+      assert.equal(hasMandatoryHits(['私有'], tf, df, 3), true);
+    });
+
+    test('hasMandatoryHits: 稀有关键词一个都没命中就淘汰', () => {
+      const df = new Map([['私有', 3], ['多少钱', 1]]);
+      const tf = new Map([['私有', 1]]);
+      assert.equal(hasMandatoryHits(['私有', '多少钱'], tf, df, 3), false);
+    });
   });
 });
 
@@ -198,7 +242,11 @@ describe('agent: generateReply', () => {
 
     const r = await generateReply({
       question: '能私有化部署吗',
-      knowledge: [{ question: '支持私有化部署吗', answer: '支持，部署到你们服务器' }],
+      // 真实场景里知识库不止一条，这里放两条更接近线上（BM25 的 idf 依赖文档总数）
+      knowledge: [
+        { question: '支持私有化部署吗', answer: '支持，部署到你们服务器', status: 'approved' },
+        { question: '怎么开发票', answer: '专票普票都可以', status: 'approved' },
+      ],
       styleMessages: [
         createMessage({
           platform: 'wecom',

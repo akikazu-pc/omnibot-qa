@@ -67,19 +67,50 @@ function buildIndex(docs) {
 }
 
 /**
+ * 必备词校验：查询里必须至少有一个「稀有关键词」在文档中出现。
+ *
+ * 为什么需要它：
+ *   「私有化多少钱」和文档「私有化部署支持国产化环境吗」共享「私有化」这个 bigram，
+ *   BM25 会给一个不低的分数，于是「国产化适配」的答案就被拿去回答「多少钱」了。
+ *   FAQ 场景里这种错误比拒答严重得多，所以这里加一道硬门槛。
+ *
+ * 判定规则：
+ *   1. 先找出查询里的「稀有关键词」—— df/总数 <= 0.6，即不是烂大街的词
+ *      （避免「你们」「支持」这类词被当成必备词，那会导致该答的不答）
+ *   2. 有稀有关键词时，文档必须命中至少一个
+ *   3. 全是常见词时不做限制，交给分数阈值判断
+ *
+ * @param {string[]} qSet 去重后的查询 token
+ * @param {Map<string,number>} tf 当前文档的词频
+ * @param {Map<string,number>} df 全局文档频次
+ * @param {number} n 文档总数
+ */
+export function hasMandatoryHits(qSet, tf, df, n) {
+  const rare = qSet.filter((q) => {
+    const d = df.get(q) || 0;
+    return n > 0 && d / n <= 0.6;
+  });
+  if (rare.length === 0) return true;
+  return rare.some((q) => (tf.get(q) || 0) > 0);
+}
+
+/**
  * BM25 打分检索。
  *
  * @param {string} query
  * @param {Array<{question:string, answer:string, [k:string]:any}>} docs
  * @param {Object} [opts]
  * @param {number} [opts.topK=3]
- * @param {number} [opts.minScore=0.5] 低于该分数视为不相关
+ * @param {number} [opts.minScore=1.2] 低于该分数视为不相关。
+ *   ⚠️ 这个阈值不能低：宁可拒答「这个我确认下再回复您」，也不能拿不相干的
+ *   答案去糊客户。FAQ 场景里一次瞎答的代价远高于一次拒答。
+ *   （调低到 0.5 会让「私有化多少钱」错误命中「国产化环境」那一条）
  * @param {number} [opts.k1=1.5]
  * @param {number} [opts.b=0.75]
  * @returns {Array<{doc:Object, score:number}>}
  */
 export function search(query, docs, opts = {}) {
-  const { topK = 3, minScore = 0.5, k1 = 1.5, b = 0.75 } = opts;
+  const { topK = 3, minScore = 1.2, k1 = 1.5, b = 0.75 } = opts;
   if (!docs || docs.length === 0) return [];
 
   const qTokens = tokenize(query);
@@ -109,7 +140,27 @@ export function search(query, docs, opts = {}) {
     // 覆盖率加成：命中的查询词占比越高越可信，避免长文档靠单个高频词刷分
     if (score > 0) score *= 0.5 + 0.5 * (hit / qSet.length);
 
+    // 必备词校验：「私有化多少钱」里「多少钱」没有命中，那这条文档就没有资格答题。
+    // 只靠总分阈值挡不住这种错误 —— BM25 会给「私有化」这个共有词一个不低的分数，
+    // 结果就是拿「国产化环境适配」的答案去回答「多少钱」，属于最伤客户的错误。
+    if (!hasMandatoryHits(qSet, tf, idx.df, idx.n)) continue;
+
     if (score >= minScore) scored.push({ doc: idx.docs[i], score });
+  }
+
+  // 知识库很小时（刚起步、只有几条 QA），idf 上不去，绝对分数天然偏低。
+  // 这时退一步用「查询覆盖率」兜底：超过半数查询词都命中，就算相关。
+  // 这解决的是「刚开始用、导入了两条对话就发现 AI 什么都不肯答」的体验问题，
+  // 而「私有化多少钱」这类真正缺信息的提问仍会被必备词校验挡掉。
+  if (!scored.length && qSet.length) {
+    for (let i = 0; i < idx.n; i++) {
+      const len = idx.docTokens[i].length || 1;
+      const tf = new Map();
+      for (const t of idx.docTokens[i]) tf.set(t, (tf.get(t) || 0) + 1);
+      if (!hasMandatoryHits(qSet, tf, idx.df, idx.n)) continue;
+      const covered = qSet.filter((q) => (tf.get(q) || 0) > 0).length / qSet.length;
+      if (covered >= 0.6) scored.push({ doc: idx.docs[i], score: minScore * covered });
+    }
   }
 
   scored.sort((a, b2) => b2.score - a.score);

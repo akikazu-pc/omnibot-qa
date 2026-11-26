@@ -17,6 +17,7 @@
  *   POST /api/message            通用消息入口（平台无关，供外部插件调用）
  *   POST /api/reply              回报我方发出的消息（配对答案的关键）
  *   POST /api/ask                AI 生成一条回复但不发送（调试/预览用）
+ *   POST /api/import             粘贴导入聊天记录（客户加好友场景的兜底路径）
  *   GET  /api/stats              统计
  *   GET  /api/qa                 列出 QA
  *   POST /api/qa/:id/approve     确认
@@ -30,6 +31,7 @@ import { fromWecom, recordOutbound } from './adapters/wecom.js';
 import { sendText, isWecomConfigured } from './adapters/wecom-send.js';
 import { fromXhs, normalizeWebhookBody } from './adapters/xhs.js';
 import { connectBot, isBotConfigured } from './adapters/wecom-bot.js';
+import { parsePastedChat, importMessages } from './adapters/paste.js';
 import { createMessage, Direction } from './collector/message.js';
 import { generateReply, isLlmConfigured } from './qa/agent.js';
 
@@ -211,6 +213,14 @@ async function handleBotMessage(raw) {
       persona: PERSONA || undefined,
       business: BUSINESS || undefined,
     });
+
+    // 没有依据时 AI 只会说「这个我确认下再回复您」。
+    // 这句话对一个机器人来说是噪音：它既没帮上客户，又占了一条回复，
+    // 还让人误以为是真人接手了。所以没有引用就干脆不吭声，留给人工。
+    if (!gen.references.length) {
+      log(`[bot] 无依据，跳过自动回复：${content.slice(0, 30)}`);
+      return '';
+    }
 
     // 落库 outbound，供 QA 配对使用
     store.insertMessage(
@@ -416,6 +426,47 @@ const server = http.createServer(async (req, res) => {
         references: gen.references.map((r) => ({ question: r.doc.question, score: Number(r.score.toFixed(3)) })),
         usedStyle: gen.usedStyle,
         usage: gen.usage,
+      });
+    }
+
+    // ---------- 粘贴导入（客户加好友场景的零门槛路径）----------
+    // 客户扫码加企微好友后，官方 API 不推消息（会话存档要付费）。
+    // 这里接收客户端「全选复制」的聊天记录文本，解析后落库并自动配对。
+    if (path === '/api/import' && req.method === 'POST') {
+      if (!authorized(req)) return json(res, 401, { error: 'unauthorized' });
+      const b = JSON.parse(await readBody(req));
+      const { text, self_name = '', customer_name = '', dry = false } = b;
+      if (!text || !String(text).trim()) return json(res, 400, { error: 'text 必填' });
+
+      const parsed = parsePastedChat(text, {
+        selfName: self_name,
+        customerName: customer_name,
+      });
+
+      const inb = parsed.messages.filter((m) => m.direction === 'inbound').length;
+      const summary = {
+        parsed: parsed.messages.length,
+        speakers: parsed.speakers,
+        self: parsed.self,
+        customer: parsed.customer,
+        inbound: inb,
+        outbound: parsed.messages.length - inb,
+        warnings: parsed.warnings,
+      };
+
+      if (dry) return json(res, 200, { ok: true, dry: true, ...summary });
+
+      const { added, skipped } = importMessages(store, parsed.messages);
+      const paired = pairAll(store);
+      log(`[import] 新增 ${added} 条消息，配对 ${paired.newPairs} 条 QA`);
+
+      return json(res, 200, {
+        ok: true,
+        ...summary,
+        added,
+        skipped,
+        newPairs: paired.newPairs,
+        unanswered: paired.unanswered,
       });
     }
 

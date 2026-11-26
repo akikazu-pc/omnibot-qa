@@ -132,6 +132,34 @@ export class Store {
     return { messages: msg, qa };
   }
 
+  /**
+   * 按方向取消息，时间升序（最近的在前，方便截取）。
+   *
+   * 用途：抽「我方历史发言」当风格样本。这是「模仿我的口吻」的数据来源，
+   * 只取 OUTBOUND，绝不把客户的话混进风格样本里。
+   *
+   * @param {string} direction Direction 枚举值
+   * @param {Object} [opts]
+   * @param {number} [opts.limit=200] 最多返回条数
+   * @param {string} [opts.platform] 限定平台
+   * @returns {Array}
+   */
+  messagesByDirection(direction, { limit = 200, platform } = {}) {
+    const where = ['direction = ?'];
+    const args = [direction];
+    if (platform) {
+      where.push('platform = ?');
+      args.push(platform);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM messages WHERE ${where.join(' AND ')}
+         ORDER BY timestamp DESC LIMIT ?`
+      )
+      .all(...args, limit);
+    return rows.reverse();
+  }
+
   /** 保存一对 QA 候选 */
   saveQaPair(pair) {
     const stmt = this.db.prepare(`

@@ -14,6 +14,8 @@
 export const Platform = Object.freeze({
   WECOM: 'wecom', // 企业微信（自建应用 / 智能机器人）
   WECOM_CS: 'wecom_cs', // 企业微信客服（外部客户）
+  WECOM_AUDIT: 'wecom_audit', // 企业微信会话内容存档（外部客户私聊，需付费开通）
+  PASTE: 'paste', // 手动粘贴/导入的聊天记录（无 API 时的兜底路径）
   XHS: 'xhs', // 小红书（聚光三方客服）
   DOUYIN: 'douyin', // 抖音（企业号私信）
   FEISHU: 'feishu',

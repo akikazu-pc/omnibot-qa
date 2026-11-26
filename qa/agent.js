@@ -78,7 +78,12 @@ export function buildSystemPrompt(ctx = {}) {
 
   if (references.length) {
     const list = references
-      .map((r, i) => `${i + 1}. 客户问：${r.doc.question}\n   我们答：${r.doc.answer}`)
+      .map((r, i) => {
+        // 只有人工审核过的答案才能当事实；pending 只能当「参考说法」，
+        // 否则自己都没确认的话会被 AI 反复复制放大
+        const tag = r.doc.status === 'approved' ? '已确认' : '未审核';
+        return `${i + 1}. [${tag}] 客户问：${r.doc.question}\n   我们答：${r.doc.answer}`;
+      })
       .join('\n');
     parts.push(`\n## 过往真实问答（这是你唯一可信的事实来源，优先采信）\n${list}`);
   } else {
@@ -98,8 +103,9 @@ export function buildSystemPrompt(ctx = {}) {
 4. 如果客户问的内容在上面找不到依据（比如问老板名字、问未提及的政策、问具体报价），
    必须只回一句"这个我确认下再回复您"，禁止猜测、禁止用风格样本里的内容充当答案。
 5. 不要把上一个问题的答案套用到当前问题上，每个问题独立判断有没有依据。
-6. 不要暴露你是 AI，不要提及"知识库""参考文档"这类内部概念。
-7. 不要输出 Markdown 标题、加粗等格式，就用自然的口语文本。`);
+6. 标注「未审核」的问答只能给你参考，如果里面含具体承诺、价格、时间，要先核实再答。
+7. 不要暴露你是 AI，不要提及"知识库""参考文档"这类内部概念。
+8. 不要输出 Markdown 标题、加粗等格式，就用自然的口语文本。`);
 
   return parts.join('\n');
 }
@@ -130,7 +136,7 @@ export async function generateReply(params) {
     fetchImpl,
   } = params;
 
-  const references = search(question, knowledge, { topK: 3, minScore: 0.5 });
+  const references = search(question, knowledge, { topK: 3, minScore: 1.2 });
   const styleSamples = collectStyleSamples(styleMessages, { limit: 8 });
 
   const system = buildSystemPrompt({ persona, business, references, styleSamples });
