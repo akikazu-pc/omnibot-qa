@@ -109,6 +109,9 @@ node server.js         # 默认 127.0.0.1:8787
 
 ### 开启自动回复
 
+> 用 `.env` 更方便：把变量写进项目根目录 `.env`（`npm run bot:setup` 会自动生成），
+> `node server.js` 和 `npm run check` 都会读它。**命令行已 export 的变量优先级更高。**
+
 ```bash
 export OPENAI_API_KEY=sk-xxx                  # 必填
 export OPENAI_BASE_URL=https://api.deepseek.com/v1   # 可选，任何 OpenAI 兼容服务
@@ -126,19 +129,38 @@ node server.js
 > **为什么必须用它**：企业微信「自建应用」的消息 API 只接受**本企业通讯录内的 userid**，
 > 发不到外部客户。要对外部客户做客服，只有智能机器人和微信客服能触达。
 
-**后台配置四步**：
+#### 第一步：后台把机器人建出来（一次性，只在网页点）
 
-1. 企业微信管理后台 → **应用管理 → 应用 → 自建 → 「+ 创建应用」**
-   （「消息推送」不行，它没有 API 权限）
-2. 应用类型选 **智能机器人**，填名称，创建
-3. 进入机器人详情 → 开启 **「API 模式」** → 选择 **「长连接」** 方式
-   （⚠️ 只能在「长连接」和「回调地址」里二选一，切到回调地址会让现有长连接立即失效）
-4. 复制 **BotID** 和 **Secret**（这是长连接专用 Secret，不是 Token/EncodingAESKey）
+1. 浏览器打开 <https://work.weixin.qq.com/> → 用管理员微信扫码登录 → 选你的企业
+2. 顶部 **「应用管理」** → 找到 **「智能机器人」** 卡片 → 点进去
+   （不在「自建应用」里，是单独的入口）
+3. 点 **「创建机器人」** → 名称填 `AKIKAZU 客服`（对外就显示这个名字）
+4. 建好后进 **机器人详情**，找到 **「接收消息 / API 模式」**，选 **「长连接」**
+   （⚠️ 长连接和「回调地址」二选一，切到回调地址会让现有连接立即失效）
+5. 在同一页复制两个值：
+   - **BotID**
+   - **Secret** —— 是「长连接 Secret」，**不是** Token / EncodingAESKey / 应用 Secret
+
+> 没有「智能机器人」入口的，通常是企业未完成认证。未认证企业功能受限，
+> 这种情况先走微信客服或人工，等认证下来再回来。
+
+#### 第二步：把两个值交给程序（不用敲命令）
+
+```bash
+npm run bot:setup      # 依次粘贴 BotID、Secret，自动写进 .env 并打码回显
+npm run bot:test       # 试连一次，看到「已连接」就成了
+npm run serve          # 起服务，自动读 .env
+```
+
+`bot:setup` 会做形态体检：`ww` 开头（多半是 CorpID）、长度 43（多半是
+EncodingAESKey）、带空格（复制多了）都会当场拦下来。`.env` 已在 `.gitignore` 里，
+权限写成 `600`。
+
+想用环境变量而不是 `.env` 也行，**命令行已 export 的变量优先级更高**：
 
 ```bash
 export WECOM_BOT_ID=你的BotID
 export WECOM_BOT_SECRET=你的Secret
-export OPENAI_API_KEY=sk-xxx
 export AUTO_REPLY=1
 node server.js
 ```

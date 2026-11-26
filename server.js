@@ -27,6 +27,8 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { loadEnvFile } from './qa/env.js';
 import { Store } from './collector/store.js';
 import { pairAll } from './qa/pair.js';
 import { fromWecom, recordOutbound } from './adapters/wecom.js';
@@ -39,6 +41,10 @@ import { generateReply, isLlmConfigured } from './qa/agent.js';
 import { matchSnippet, validateSnippets } from './qa/snippets.js';
 import { checkCardWidth } from './qa/card.js';
 import { buildPriceReply, explainPriceReply } from './qa/price-reply.js';
+
+// 先把项目根目录的 .env 读进来（命令行已 export 的变量优先，不被覆盖）
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+loadEnvFile(path.join(ROOT, '.env'));
 
 const PORT = Number(process.env.PORT || 8787);
 const DB = process.env.OMNIBOT_DB || 'data/omnibot.db';

@@ -5,9 +5,15 @@
  * 检查环境变量是否齐全，告诉你缺什么、去哪拿。
  * 用法：node scripts/setup-check.js
  */
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { loadEnvFile } from '../qa/env.js';
 import { isBotConfigured, loadBotConfig } from '../adapters/wecom-bot.js';
 import { isWecomConfigured, loadWecomConfig } from '../adapters/wecom-send.js';
 import { isLlmConfigured } from '../qa/agent.js';
+
+// 读项目根 .env，这样 node scripts/setup-check.js 和 npm run serve 看到的是同一份配置
+loadEnvFile(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.env'));
 
 const c = process.stdout.isTTY ? '\x1b[36m' : '';
 const g = process.stdout.isTTY ? '\x1b[32m' : '';
