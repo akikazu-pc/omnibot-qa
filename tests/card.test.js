@@ -262,10 +262,16 @@ describe('snippets: data/snippets.example.json', () => {
     assert.deepEqual(validateSnippets(list), []);
   });
 
-  test('问价能命中', () => {
-    const r = matchSnippet('你们这个多少钱', list);
+  test('问价不再走话术（已交给 qa/price-reply.js 发价格页）', () => {
+    // 话术库里保留 price 会和网站价格页卡片抢，所以示例配置里必须没有它
+    assert.equal(list.find((s) => s.id === 'price'), undefined);
+    assert.equal(matchSnippet('你们这个多少钱', list), null);
+  });
+
+  test('定制开发仍然走话术', () => {
+    const r = matchSnippet('能定制开发吗', list);
     assert.ok(r, '应该命中');
-    assert.equal(r.id, 'price');
+    assert.equal(r.id, 'price-enterprise');
   });
 
   test('所有卡片都在安全宽度内，手机端不折行', () => {
@@ -290,14 +296,6 @@ describe('snippets: 真实提问回归集', () => {
   ).snippets;
 
   const shouldHit = [
-    ['这个多少钱', 'price'],
-    ['多少钱啊', 'price'],
-    ['请问什么价', 'price'],
-    ['能报个价吗', 'price'],
-    ['你们怎么收费', 'price'],
-    ['咋卖的', 'price'],
-    ['这个价格多少', 'price'],
-    ['多少钱一套', 'price'],
     ['私有化怎么弄', 'price-enterprise'],
     ['能本地部署嘛', 'price-enterprise'],
     ['能试用不', 'trial'],
@@ -337,6 +335,7 @@ describe('snippets: 真实提问回归集', () => {
     '有价格表模板吗',
     '帮我做个 excel',
     '这个功能怎么用',
+    // 报价句由 price-reply 接管，话术库必须放空，否则会文不对题
     // contact 是 requireQuestion:false（「转人工」不带问号），
     // 所以必须确认它不会被「讨论人工」的句子误触
     '你们是人工回复吗',
