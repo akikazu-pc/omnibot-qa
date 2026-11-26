@@ -24,7 +24,8 @@
     "test": "node --test \"tests/**/*.test.js\"",
     "bot:setup": "node scripts/setup-bot.js",
     "bot:test": "node scripts/setup-bot.js --test",
-    "bot:show": "node scripts/setup-bot.js --show"
+    "bot:show": "node scripts/setup-bot.js --show",
+    "kf:setup": "node scripts/setup-bot.js --kf"
   },
   "keywords": [
     "wecom",

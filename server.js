@@ -35,12 +35,23 @@ import { fromWecom, recordOutbound } from './adapters/wecom.js';
 import { sendText, isWecomConfigured } from './adapters/wecom-send.js';
 import { fromXhs, normalizeWebhookBody } from './adapters/xhs.js';
 import { connectBot, isBotConfigured } from './adapters/wecom-bot.js';
+import {
+  parseCallback as parseKfCallback,
+  syncMessages as kfSyncMessages,
+  sendKfText as kfSendText,
+  sendKfEventResponse as kfSendEventResponse,
+  normalizeKfMessage,
+  isKfConfigured,
+  isKfCallbackConfigured,
+  loadKfConfig,
+} from './adapters/wecom-kf.js';
 import { parsePastedChat, importMessages } from './adapters/paste.js';
 import { createMessage, Direction } from './collector/message.js';
 import { generateReply, isLlmConfigured } from './qa/agent.js';
 import { matchSnippet, validateSnippets } from './qa/snippets.js';
 import { checkCardWidth } from './qa/card.js';
 import { buildPriceReply, explainPriceReply } from './qa/price-reply.js';
+import { decide } from './qa/decide.js';
 
 // 先把项目根目录的 .env 读进来（命令行已 export 的变量优先，不被覆盖）
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -281,76 +292,195 @@ async function handleBotMessage(raw) {
   if (!added) return ''; // 重复推送，忽略
   if (!AUTO_REPLY) return '';
 
-  // 问价 → 直接发对应语言的价格页卡片。
-  // 放在话术之前：价格只在网站上维护一份，机器人不复述数字，
-  // 避免两边价格不一致（改了网站忘了改话术是最常见的翻车方式）。
-  if (PRICE_REPLY_ENABLED) {
-    const price = buildPriceReply(content);
-    if (price) {
-      log(`[bot] 报价卡片 ${price.lang} → ${price.url}`);
-      store.insertMessage(
-        recordOutbound(isGroup ? raw.ChatId : raw.FromUserName, price.plain, {
-          platform: 'wecom',
-          isGroup,
-          chatId: raw.ChatId,
-          agentId: 'bot',
-        })
-      );
-      // 返回对象形式 → 适配器发 template_card，而不是 markdown
-      return { card: price.card };
-    }
-  }
+  // 三层递进：价格页 → 话术 → 模型。详见 qa/decide.js
+  const d = await decide({
+    content,
+    enablePrice: PRICE_REPLY_ENABLED,
+    snippets: loadSnippets(),
+    knowledge: loadKnowledge(),
+    styleMessages: loadStyleMessages(),
+    persona: PERSONA || undefined,
+    business: BUSINESS || undefined,
+    generate: (p) => generateReply(p),
+    isLlmReady: isLlmConfigured,
+    history: store.getConversation('wecom', conversationId, { limit: 20 }),
+  });
 
-  // 话术优先：报价、发票这类必须一字不差，而且不需要 LLM 也能跑
-  const hit = matchSnippet(content, loadSnippets());
-  if (hit) {
-    log(`[bot] 话术命中「${hit.label || hit.id}」`);
+  if (d.kind === 'price') {
+    log(`[bot] 报价卡片 ${d.price.lang} → ${d.price.url}`);
     store.insertMessage(
-      recordOutbound(isGroup ? raw.ChatId : raw.FromUserName, hit.reply, {
+      recordOutbound(isGroup ? raw.ChatId : raw.FromUserName, d.text, {
         platform: 'wecom',
         isGroup,
         chatId: raw.ChatId,
         agentId: 'bot',
       })
     );
-    return hit.reply;
+    // 返回对象形式 → 适配器发 template_card，而不是 markdown
+    return { card: d.price.card };
   }
 
-  if (!isLlmConfigured()) return '';
+  if (d.kind === 'snippet') {
+    log(`[bot] 话术命中「${d.snippetId}」`);
+    store.insertMessage(
+      recordOutbound(isGroup ? raw.ChatId : raw.FromUserName, d.text, {
+        platform: 'wecom',
+        isGroup,
+        chatId: raw.ChatId,
+        agentId: 'bot',
+      })
+    );
+    return d.text;
+  }
 
-  try {
-    const gen = await generateReply({
-      question: content,
-      history: store.getConversation('wecom', conversationId, { limit: 20 }),
+  if (d.kind === 'llm') {
+    store.insertMessage(
+      recordOutbound(isGroup ? raw.ChatId : raw.FromUserName, d.text, {
+        platform: 'wecom',
+        isGroup,
+        chatId: raw.ChatId,
+        agentId: 'bot',
+      })
+    );
+    log(`[bot] ← ${d.text.slice(0, 50)}`);
+    return d.text;
+  }
+
+  if (d.reason === 'no-knowledge-hit') {
+    log(`[bot] 无依据，跳过自动回复：${content.slice(0, 30)}`);
+  }
+  return '';
+}
+
+/**
+ * 处理一条微信客服通知：拉消息 → 决策 → 回复
+ *
+ * cursor 必须持久化 —— 微信客服的 sync_msg 是增量拉取，
+ * 漏掉一次就永久丢那批消息（官方没给重发机制）。
+ * 这里用 data/kf-cursor.json 存游标，按客服账号（open_kfid）分开。
+ */
+async function handleKfNotification(cb) {
+  if (!isKfConfigured()) {
+    log('[kf] 未配置 KF_CORP_ID / KF_SECRET，无法拉取消息');
+    return;
+  }
+
+  const cursor = readKfCursor(cb.openKfid);
+  const pulled = await kfSyncMessages({
+    cursor,
+    token: cb.token,
+    openKfid: cb.openKfid || undefined,
+  });
+
+  if (!pulled.ok) {
+    log(`[kf] 拉取失败：${pulled.error}`);
+    return;
+  }
+
+  // 无论有没有消息，都要把游标推进并落盘，否则下次会重复拉
+  if (pulled.nextCursor && pulled.nextCursor !== cursor) {
+    writeKfCursor(cb.openKfid, pulled.nextCursor);
+  }
+
+  if (!pulled.messages.length) {
+    log('[kf] 无新消息');
+    return;
+  }
+
+  for (const m of pulled.messages) {
+    const n = normalizeKfMessage(m);
+    if (!n.fromCustomer) continue; // 系统推送不用回
+    if (!n.content) continue;
+
+    const conversationId = `kf:${n.openKfid}:${n.externalUserId}`;
+    const msg = {
+      platform: 'wechat_kf',
+      conversation_id: conversationId,
+      sender_id: n.externalUserId,
+      sender_name: '',
+      msg_type: n.msgType,
+      content: n.content,
+      msg_id: n.msgid,
+      create_time: n.sendTime || Math.floor(Date.now() / 1000),
+      is_group: false,
+      chat_id: n.openKfid,
+    };
+    const added = store.insertMessage(msg);
+    if (!added) continue; // 重复消息，跳过
+
+    log(`[kf] ${n.externalUserId.slice(0, 12)}… ${n.content.slice(0, 50)}`);
+    if (!AUTO_REPLY) continue;
+
+    const d = await decide({
+      content: n.content,
+      enablePrice: PRICE_REPLY_ENABLED,
+      snippets: loadSnippets(),
       knowledge: loadKnowledge(),
       styleMessages: loadStyleMessages(),
       persona: PERSONA || undefined,
       business: BUSINESS || undefined,
+      generate: (p) => generateReply(p),
+      isLlmReady: isLlmConfigured,
+      history: store.getConversation('wechat_kf', conversationId, { limit: 20 }),
     });
 
-    // 没有依据时 AI 只会说「这个我确认下再回复您」。
-    // 这句话对一个机器人来说是噪音：它既没帮上客户，又占了一条回复，
-    // 还让人误以为是真人接手了。所以没有引用就干脆不吭声，留给人工。
-    if (!gen.references.length) {
-      log(`[bot] 无依据，跳过自动回复：${content.slice(0, 30)}`);
-      return '';
+    if (!d.text) {
+      if (d.reason === 'no-knowledge-hit') {
+        log(`[kf] 无依据，留给人工：${n.content.slice(0, 30)}`);
+      }
+      continue;
     }
 
-    // 落库 outbound，供 QA 配对使用
     store.insertMessage(
-      recordOutbound(isGroup ? raw.ChatId : raw.FromUserName, gen.text, {
-        platform: 'wecom',
-        isGroup,
-        chatId: raw.ChatId,
-        agentId: 'bot',
+      recordOutbound(n.externalUserId, d.text, {
+        platform: 'wechat_kf',
+        isGroup: false,
+        chatId: n.openKfid,
+        agentId: 'kf',
       })
     );
 
-    log(`[bot] ← ${gen.text.slice(0, 50)}`);
-    return gen.text;
-  } catch (err) {
-    log(`[bot] 生成回复失败: ${err.message}`);
+    // ⚠️ 微信客服的 send_msg 只支持纯文本，不支持 markdown 也不支持卡片。
+    // 所以问价时那条 URL 只能以纯文本形式发出（用户长按复制），
+    // 这也是为什么内部智能机器人那条路要用 template_card —— 那边支持。
+    const sent = await kfSendText({
+      touser: n.externalUserId,
+      openKfid: n.openKfid,
+      content: d.text,
+    });
+    log(`[kf] ${sent.ok ? '→ 已发送' : `✗ ${sent.error}`} ${d.text.slice(0, 40)}`);
+  }
+}
+
+// ─────────────────────── 游标持久化 ───────────────────────
+
+const KF_CURSOR_FILE = path.join(ROOT, 'data', 'kf-cursor.json');
+
+function readKfCursor(openKfid) {
+  try {
+    if (!fs.existsSync(KF_CURSOR_FILE)) return '';
+    const j = JSON.parse(fs.readFileSync(KF_CURSOR_FILE, 'utf8'));
+    return j[openKfid || '_all'] || '';
+  } catch {
     return '';
+  }
+}
+
+function writeKfCursor(openKfid, cursor) {
+  try {
+    fs.mkdirSync(path.dirname(KF_CURSOR_FILE), { recursive: true });
+    let j = {};
+    if (fs.existsSync(KF_CURSOR_FILE)) {
+      try {
+        j = JSON.parse(fs.readFileSync(KF_CURSOR_FILE, 'utf8'));
+      } catch {
+        j = {};
+      }
+    }
+    j[openKfid || '_all'] = cursor;
+    fs.writeFileSync(KF_CURSOR_FILE, JSON.stringify(j, null, 2));
+  } catch (err) {
+    log(`[kf] 游标落盘失败：${err.message}`);
   }
 }
 
@@ -361,6 +491,41 @@ const server = http.createServer(async (req, res) => {
   try {
     if (path === '/health') {
       return json(res, 200, { ok: true, db: DB, stats: store.stats() });
+    }
+
+    // ---------- 微信客服（对外渠道：外部客户可直接对话） ----------
+    //
+    // 协议是「两段式」，和别的平台不一样：
+    //   1. 微信客服 → 我们的回调 URL，XML 通知「有新消息」（不带正文）
+    //   2. 我们 → sync_msg 主动拉取消息正文
+    //
+    // 漏拉一次就永久丢消息，所以 cursor 必须持久化，不能只放内存。
+    if (path === '/hook/kf') {
+      const body = await readBody(req);
+
+      if (req.method === 'GET') {
+        // 微信客服后台的 URL 校验：回显 echostr
+        return res.writeHead(200).end(String(url.searchParams.get('echostr') || ''));
+      }
+
+      const cb = parseKfCallback(body);
+      if (!cb.ok) {
+        log(`[kf] 忽略回调：${cb.error}`);
+        return json(res, 200, { ok: true, ignored: true });
+      }
+
+      // 先立刻回 200，微信客服要求 5 秒内响应；
+      // 拉取和处理放到后台异步做，别让对方等。
+      json(res, 200, { ok: true });
+
+      setImmediate(async () => {
+        try {
+          await handleKfNotification(cb);
+        } catch (err) {
+          log(`[kf] 处理失败: ${err.message}`);
+        }
+      });
+      return undefined;
     }
 
     // ---------- 企业微信 ----------
@@ -726,7 +891,12 @@ server.listen(PORT, () => {
     log(`   LLM: ${isLlmConfigured() ? '✅ 已配置' : '❌ 未配置（设置 OPENAI_API_KEY）'}`);
     log(`   企业微信发送: ${isWecomConfigured() ? '✅ 已配置' : '❌ 未配置（回复只落库不发送）'}`);
   }
-  log('   回调入口: /hook/wecom  /hook/wecombot  /hook/xhs  /api/message');
+  log('   回调入口: /hook/wecom  /hook/wecombot  /hook/kf  /hook/xhs  /api/message');
+  if (isKfConfigured()) {
+    log('   微信客服(对外): ✅ 已配置 KF_CORP_ID / KF_SECRET');
+  } else {
+    log('   微信客服(对外): ❌ 未配置 KF_CORP_ID / KF_SECRET');
+  }
   log('─'.repeat(52));
 });
 

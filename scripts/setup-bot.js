@@ -20,6 +20,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ENV_PATH = path.join(ROOT, '.env');
 
 const KEYS = ['WECOM_BOT_ID', 'WECOM_BOT_SECRET', 'AUTO_REPLY'];
+const KF_KEYS = ['KF_CORP_ID', 'KF_SECRET', 'KF_TOKEN', 'KF_AES_KEY'];
 
 /** 极简 .env 读写（不引依赖） */
 export function readEnv(file = ENV_PATH) {
@@ -100,14 +101,85 @@ async function tryConnect({ botId, secret }) {
   });
 }
 
+/**
+ * 微信客服凭据配置（对外渠道）
+ *
+ * 四个值分别来自两个地方：
+ *   KF_CORP_ID   kf.weixin.qq.com → 企业信息 → 企业ID
+ *   KF_SECRET    kf.weixin.qq.com → 开发配置 → Secret（点开能看到）
+ *   KF_TOKEN     开发配置里自己填的 Token（英文数字 ≤32 位）
+ *   KF_AES_KEY   开发配置里自己填的 EncodingAESKey（43 位英文数字）
+ */
+async function setupKf(cur) {
+  const rl = readline.createInterface({ input, output });
+  console.log('');
+  console.log('微信客服 · 凭据配置（对外渠道，外部客户可直接对话）');
+  console.log('─'.repeat(52));
+  console.log('kf.weixin.qq.com → 企业信息 / 开发配置');
+  console.log('');
+
+  const ask = async (label, curVal) => {
+    const v = (await rl.question(label)).trim();
+    return v || curVal || '';
+  };
+
+  const corpId = await ask('企业ID (KF_CORP_ID):    ', cur.KF_CORP_ID);
+  const secret = await ask('Secret (KF_SECRET):   ', cur.KF_SECRET);
+  const token = await ask('Token (KF_TOKEN):      ', cur.KF_TOKEN);
+  const aesKey = await ask('EncodingAESKey:       ', cur.KF_AES_KEY);
+  rl.close();
+
+  const problems = [];
+  if (!corpId) problems.push('企业ID 不能为空');
+  if (!secret) problems.push('Secret 不能为空');
+  if (!token) problems.push('Token 不能为空（回调验签要配）');
+  if (!aesKey) problems.push('EncodingAESKey 不能为空');
+  if (aesKey && aesKey.length !== 43) problems.push(`EncodingAESKey 应为 43 位，当前 ${aesKey.length} 位`);
+  if (token && !/^[A-Za-z0-9]{1,32}$/.test(token)) problems.push('Token 应是英文数字且不超过 32 位');
+
+  if (problems.length) {
+    console.log('');
+    console.log('⚠️  有问题：');
+    for (const p of problems) console.log('   · ' + p);
+    process.exit(1);
+  }
+
+  const file = writeEnv({ KF_CORP_ID: corpId, KF_SECRET: secret, KF_TOKEN: token, KF_AES_KEY: aesKey });
+  console.log('');
+  console.log(`✅ 已写入 ${path.relative(process.cwd(), file) || file}`);
+  console.log(`   KF_CORP_ID = ${corpId}`);
+  console.log(`   KF_SECRET = ${mask(secret)}`);
+  console.log(`   KF_TOKEN  = ${mask(token)}`);
+  console.log(`   KF_AES_KEY = ${mask(aesKey)}`);
+  console.log('');
+  console.log('下一步：');
+  console.log('   npm run serve            # 起服务，会带 .env 里的配置');
+  console.log('   然后把回调地址填到微信客服后台：');
+  console.log('   https://你的域名/hook/kf');
+  console.log('');
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const cur = readEnv();
 
   if (argv.includes('--show')) {
     console.log('当前 .env 配置：');
-    for (const k of KEYS) console.log(`  ${k} = ${k.includes('SECRET') ? mask(cur[k]) : cur[k] || '(未设置)'}`);
+    console.log('  ── 微信客服（对外，外部客户可直接对话）──');
+    for (const k of KF_KEYS) {
+      const v = cur[k];
+      console.log(`  ${k} = ${v ? (k.includes('SECRET') || k.includes('AES') ? mask(v) : v) : '(未设置)'}`);
+    }
+    console.log('  ── 企微智能机器人（对内员工用）──');
+    for (const k of KEYS) {
+      const v = cur[k];
+      console.log(`  ${k} = ${v ? (k.includes('SECRET') ? mask(v) : v) : '(未设置)'}`);
+    }
     return;
+  }
+
+  if (argv.includes('--kf')) {
+    return setupKf(cur);
   }
 
   if (argv.includes('--test')) {
