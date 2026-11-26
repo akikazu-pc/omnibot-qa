@@ -195,6 +195,89 @@ export function buildReply(reqId, content, opts = {}) {
 }
 
 /**
+ * 构造模板卡片回复帧。
+ *
+ * 为什么需要这个：单聊里 markdown 的 `a` 标签不会被渲染成可点链接，
+ * 客户看到的是一串裸 URL。而模板卡片是原生卡片，
+ * 底部按钮的 `card_action.type = 1` 能真正跳转网页。
+ *
+ * 「问价 → 发价格表页面」这个需求只能靠卡片实现，
+ * 靠 markdown 发链接在单聊里等于没发。
+ *
+ * 卡片类型取 text_notice：纯文字排版，不需要图片素材，
+ * 适合「服务名称 + 价格说明 + 跳转按钮」这种结构。
+ *
+ * @param {string} reqId
+ * @param {object} card 模板卡片结构（见官方 template_card 定义）
+ * @returns {object}
+ */
+export function buildReplyCard(reqId, card) {
+  return {
+    cmd: WsCmd.RESPONSE,
+    headers: { req_id: reqId },
+    body: {
+      msgtype: 'template_card',
+      template_card: card,
+    },
+  };
+}
+
+/**
+ * 拼一张「价格页跳转」卡片。
+ *
+ * @param {Object} p
+ * @param {string} p.title      主标题，如「上门装机 · 价格」
+ * @param {string} [p.desc]     标题右侧辅助信息
+ * @param {string} [p.subtitle] 二级说明，建议 ≤ 112 字
+ * @param {string} p.url        点击卡片跳转的地址
+ * @param {string} [p.urlLabel] 底部提示文案
+ * @param {string} [p.iconUrl]  来源图标
+ * @param {string} [p.sourceDesc] 来源描述，如站点名
+ * @param {Array} [p.rows]      [{keyname, value}] 横向两列信息，最多 6 条
+ * @returns {object} template_card
+ */
+export function buildPriceCard({
+  title,
+  desc = '',
+  subtitle = '',
+  url,
+  urlLabel = '',
+  iconUrl = '',
+  sourceDesc = '',
+  rows = [],
+}) {
+  if (!title) throw new Error('buildPriceCard: title 必填');
+  if (!url) throw new Error('buildPriceCard: url 必填');
+
+  const card = {
+    card_type: 'text_notice',
+    main_title: desc ? { title, desc } : { title },
+    // type:1 = 跳转 URL。这是整个卡片能点得动的关键
+    card_action: { type: 1, url },
+  };
+
+  if (sourceDesc) {
+    card.source = iconUrl ? { icon_url: iconUrl, desc: sourceDesc } : { desc: sourceDesc };
+  }
+
+  if (subtitle) card.sub_title_text = subtitle;
+
+  if (rows.length) {
+    card.horizontal_content_list = rows
+      .filter((r) => r && r.keyname)
+      .slice(0, 6)
+      .map((r) => ({ keyname: r.keyname, value: String(r.value ?? '') }));
+  }
+
+  if (urlLabel) {
+    // jump_list 最多 3 条，这里只放一条，避免客户不知道点哪
+    card.jump_list = [{ type: 1, title: urlLabel, url }];
+  }
+
+  return card;
+}
+
+/**
  * 构造主动发消息帧（无用户消息触发时用，如定时提醒）。
  * 单聊用 user_id，群聊用 chatid。
  */
@@ -313,17 +396,26 @@ export function connectBot({
 
   async function handleCallback(frame) {
     const msg = normalizeBotBody(frame.body);
-    let reply = '';
+    let reply = null;
     try {
-      reply = (await onMessage(msg, { reqId: frame.reqId, raw: frame.body })) || '';
+      reply = (await onMessage(msg, { reqId: frame.reqId, raw: frame.body })) || null;
     } catch (err) {
       logger.error?.('[ws] 处理消息失败:', err.message);
-      reply = '';
+      reply = null;
     }
-    // 有内容才回复；空字符串表示不回复（如机器人自己发的、重复消息）
-    if (reply) {
-      rawSend(buildReply(frame.reqId, reply));
+
+    // onMessage 可以返回三种东西：
+    //   ''            → 不回复（重复消息、机器人自己发的）
+    //   '文本'        → 当成 markdown 流式回复
+    //   { card: {...} } → 发模板卡片（单聊里唯一能让客户点得动的形式）
+    if (!reply) return;
+
+    if (typeof reply === 'object' && reply.card) {
+      rawSend(buildReplyCard(frame.reqId, reply.card));
+      return;
     }
+
+    rawSend(buildReply(frame.reqId, String(reply)));
   }
 
   function open() {

@@ -38,6 +38,7 @@ import { createMessage, Direction } from './collector/message.js';
 import { generateReply, isLlmConfigured } from './qa/agent.js';
 import { matchSnippet, validateSnippets } from './qa/snippets.js';
 import { checkCardWidth } from './qa/card.js';
+import { buildPriceReply, explainPriceReply } from './qa/price-reply.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const DB = process.env.OMNIBOT_DB || 'data/omnibot.db';
@@ -49,6 +50,8 @@ const BUSINESS = process.env.BOT_BUSINESS || '';
 const BOT_WS_ENABLED = process.env.WECOM_BOT_WS === '1' || isBotConfigured();
 /** 话术库文件（报价、发票这类必须一字不差的回复） */
 const SNIPPETS_FILE = process.env.OMNIBOT_SNIPPETS || 'data/snippets.json';
+/** 问价时发价格页卡片（设成 0 可关掉，退回纯话术/LLM） */
+const PRICE_REPLY_ENABLED = process.env.OMNIBOT_PRICE_CARD !== '0';
 
 const store = new Store(DB);
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -271,6 +274,26 @@ async function handleBotMessage(raw) {
 
   if (!added) return ''; // 重复推送，忽略
   if (!AUTO_REPLY) return '';
+
+  // 问价 → 直接发对应语言的价格页卡片。
+  // 放在话术之前：价格只在网站上维护一份，机器人不复述数字，
+  // 避免两边价格不一致（改了网站忘了改话术是最常见的翻车方式）。
+  if (PRICE_REPLY_ENABLED) {
+    const price = buildPriceReply(content);
+    if (price) {
+      log(`[bot] 报价卡片 ${price.lang} → ${price.url}`);
+      store.insertMessage(
+        recordOutbound(isGroup ? raw.ChatId : raw.FromUserName, price.plain, {
+          platform: 'wecom',
+          isGroup,
+          chatId: raw.ChatId,
+          agentId: 'bot',
+        })
+      );
+      // 返回对象形式 → 适配器发 template_card，而不是 markdown
+      return { card: price.card };
+    }
+  }
 
   // 话术优先：报价、发票这类必须一字不差，而且不需要 LLM 也能跑
   const hit = matchSnippet(content, loadSnippets());
@@ -535,6 +558,37 @@ const server = http.createServer(async (req, res) => {
         references: gen.references.map((r) => ({ question: r.doc.question, score: Number(r.score.toFixed(3)) })),
         usedStyle: gen.usedStyle,
         usage: gen.usage,
+      });
+    }
+
+    // ---------- 报价卡片预览（不需要 LLM key）----------
+    // 客户问一句，看机器人会回哪张卡片、跳哪个页面。
+    // 支持 ?lang= 强制指定语言，用来看多语言效果。
+    if (path === '/api/price' && req.method === 'POST') {
+      if (!authorized(req)) return json(res, 401, { error: 'unauthorized' });
+      const b = JSON.parse(await readBody(req));
+      const { text } = b;
+      if (!text) return json(res, 400, { error: 'text 必填' });
+
+      const result = buildPriceReply(text, { lang: b.lang || url.searchParams.get('lang') || '' });
+      if (!result) {
+        return json(res, 200, {
+          text,
+          matched: false,
+          reason: 'not-a-price-question',
+          hint: '这条不是问价，或是在抱怨价格，会走话术 / AI',
+        });
+      }
+      return json(res, 200, {
+        text,
+        matched: true,
+        lang: result.lang,
+        page: result.key,
+        url: result.url,
+        reason: result.reason,
+        services: result.services,
+        card: result.card,
+        preview: explainPriceReply(result),
       });
     }
 

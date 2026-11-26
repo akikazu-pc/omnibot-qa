@@ -232,6 +232,7 @@ node scripts/setup-snippets.js try "多少钱"  # 模拟客户提问看命中哪
 | POST | `/api/import` | 粘贴导入聊天记录（`{"text":"...","self_name":"小王"}`） |
 | POST | `/api/ask` | AI 生成一条回复但不发送（调优用） |
 | POST | `/api/snippet` | 预览话术匹配结果（不发送、不需要模型 key） |
+| POST | `/api/price` | 预览问价发出的卡片与跳转链接（`{"text":"多少钱","lang":"ja"}`） |
 | POST | `/api/pair` | 手动触发配对 |
 | GET | `/api/qa?status=pending` | 列出 QA |
 | POST | `/api/qa/:id/approve` | 确认 |
@@ -300,7 +301,11 @@ omnibot-qa/
 │   ├── knowledge.js    # BM25 检索（中文 bigram，零依赖）
 │   ├── agent.js        # 风格抽取 + prompt 组装 + 生成回复
 │   ├── snippets.js     # 话术匹配（问句判定 + 优先级 + 负面词）
-│   └── card.js         # 卡片渲染 + 手机端宽度检测
+│   ├── card.js         # 卡片渲染 + 手机端宽度检测
+│   ├── site-map.js     # 站点页面地图 + 语言前缀拼接
+│   ├── lang-detect.js  # 客户语言识别（简/繁/英/日）
+│   ├── price-router.js # 问价意图 → 该发哪个页面
+│   └── price-reply.js  # 组装报价卡片
 ├── llm/
 │   └── provider.js     # OpenAI 兼容调用（任何厂商都能接）
 ├── scripts/
@@ -314,10 +319,70 @@ omnibot-qa/
 ├── data/
 │   ├── snippets.example.json # 话术模板（跟着仓库走）
 │   └── snippets.json         # 你的实际话术（本地，不进仓库）
-├── tests/              # 191 个用例
+├── tests/              # 348 个用例
 ├── cli.js
 └── server.js
 ```
+
+## 问价就发价格表页面（模板卡片）
+
+客户问「多少钱」，机器人不报数字，直接回一张卡片，点开就是网站的价格表。
+
+**价格只在网站上维护一份。** 写死在话术里要改代码、要重启，改漏一个套餐就是报错价 ——
+而客户截图留证，最后是你认。
+
+### 为什么必须用模板卡片，不能用 markdown 链接
+
+企微**单聊**里 markdown 的 `a` 标签不渲染，客户看到的是一串裸 URL，点不动。
+只有模板卡片的 `card_action.type = 1` 才能真正跳转。这是硬约束，不是偏好。
+
+### 发哪个页面：有几分信息发多细
+
+| 客户说 | 发他 |
+| --- | --- |
+| 多少钱 / 价格 / 报个价 | `/service` 服务总表 |
+| 装机 / 组装 多少钱 | `/service/desktop?item=assembly` |
+| 笔记本清灰多少钱 | `/service/laptop?item=cleaning` |
+| 装机 + 清灰 多少钱 | `/service/desktop`（台式机总页） |
+| 有上门吗 | `/service/onsite`（上门区域与费用） |
+| 太贵了 / 能便宜点 | **不发**，交给 AI 或人工 |
+
+规则写死在 `qa/price-router.js`，加服务项改 `SERVICE_KEYS` 和 `SERVICE_HINTS` 即可。
+
+**「笔记本清灰」为什么不会被台式机抢走**：中文里「清灰」「维修」两者共用，
+所以判定时先看有没有笔记本语境，有就把台式机同名词压掉。
+
+### 多语言：客户用什么语言问，就给什么语言的页面
+
+| 语言 | 前缀 | 例 |
+| --- | --- | --- |
+| 简体中文 | `/zh-CN` | `akikazu.co.jp/zh-CN/service` |
+| 繁体中文 | `/zh-TW` | `akikazu.co.jp/zh-TW/service` |
+| 英文 | `/en-US` | `akikazu.co.jp/en-US/service` |
+| 日语 | 无前缀 | `akikazu.co.jp/service` |
+
+识别靠 `qa/lang-detect.js`：假名 → 日语（最硬的信号），
+繁体专用字/繁体用词 → 繁中，纯 ASCII 且有 3 个以上字母 → 英文，其余 → 简中。
+
+**认不出来就发简体**，绝不会因为识别失败而发错语言。
+
+### 预览
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/price \
+  -H "Content-Type: application/json" \
+  -d '{"text":"装机多少钱"}'
+
+# 强制看某语言
+curl -X POST http://127.0.0.1:8787/api/price \
+  -H "Content-Type: application/json" \
+  -d '{"text":"多少钱","lang":"ja"}'
+```
+
+返回 `url`、命中的页面、以及完整的 `card` 结构（就是会发给企微的那份 JSON）。
+不发送、不需要 `OPENAI_API_KEY`。
+
+设 `OMNIBOT_PRICE_CARD=0` 可整体关掉，退回话术 / AI。
 
 ## 话术库：报价这类内容不要交给 AI
 
@@ -448,7 +513,7 @@ curl -X POST http://127.0.0.1:8787/api/snippet \
 ## 测试
 
 ```bash
-npm test                          # 191 个用例，纯本地，不联网
+npm test                          # 348 个用例，纯本地，不联网
 node scripts/e2e-import.js        # 粘贴导入全链路（假 LLM，验证结构）
 OPENAI_API_KEY=sk-xx node scripts/e2e-import.js --live   # 用真模型看草稿质量
 ```
