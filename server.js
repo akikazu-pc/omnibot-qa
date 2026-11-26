@@ -37,6 +37,7 @@ import { fromXhs, normalizeWebhookBody } from './adapters/xhs.js';
 import { connectBot, isBotConfigured } from './adapters/wecom-bot.js';
 import {
   parseCallback as parseKfCallback,
+  parseCallbackXml,
   syncMessages as kfSyncMessages,
   sendKfText as kfSendText,
   sendKfEventResponse as kfSendEventResponse,
@@ -52,6 +53,11 @@ import { matchSnippet, validateSnippets } from './qa/snippets.js';
 import { checkCardWidth } from './qa/card.js';
 import { buildPriceReply, explainPriceReply } from './qa/price-reply.js';
 import { decide } from './qa/decide.js';
+import {
+  verifySignature,
+  decryptMessage,
+  parsePlainCallback,
+} from './qa/wecom-crypto.js';
 
 // 先把项目根目录的 .env 读进来（命令行已 export 的变量优先，不被覆盖）
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -502,13 +508,71 @@ const server = http.createServer(async (req, res) => {
     // 漏拉一次就永久丢消息，所以 cursor 必须持久化，不能只放内存。
     if (path === '/hook/kf') {
       const body = await readBody(req);
+      const kfCfg = loadKfConfig();
 
+      // ① URL 校验（GET）：企业微信会带 echostr 过来，
+      //    配了 EncodingAESKey 时 echostr 是加密的，必须解密后原样回包。
       if (req.method === 'GET') {
-        // 微信客服后台的 URL 校验：回显 echostr
-        return res.writeHead(200).end(String(url.searchParams.get('echostr') || ''));
+        const echostr = String(url.searchParams.get('echostr') || '');
+        if (!echostr) return res.writeHead(200).end('');
+
+        if (kfCfg.aesKey) {
+          const ok = verifySignature({
+            token: kfCfg.token,
+            timestamp: url.searchParams.get('timestamp') || '',
+            nonce: url.searchParams.get('nonce') || '',
+            msgSignature: url.searchParams.get('msg_signature') || '',
+            encrypt: echostr,
+          });
+          if (!ok) {
+            log('[kf] URL 校验失败：签名不对，检查 KF_TOKEN');
+            return res.writeHead(401).end('invalid signature');
+          }
+          try {
+            const d = decryptMessage(echostr, kfCfg.aesKey, kfCfg.corpId);
+            log('[kf] ✅ URL 校验通过');
+            return res.writeHead(200).end(d.message);
+          } catch (err) {
+            log(`[kf] URL 校验解密失败：${err.message}`);
+            return res.writeHead(400).end('decrypt failed');
+          }
+        }
+        // 没配 aesKey（明文模式）：直接回显
+        return res.writeHead(200).end(echostr);
       }
 
-      const cb = parseKfCallback(body);
+      // ② 消息回调（POST）
+      //    配了 EncodingAESKey 时 body 是 <xml><Encrypt>...</Encrypt></xml>，要先验签再解密。
+      let cb = null;
+      if (kfCfg.aesKey) {
+        const outer = parseCallbackXml(body);
+        const encrypt = outer.Encrypt || outer.encrypt || '';
+        if (!encrypt) {
+          log('[kf] 收到未加密的消息，但配置了 KF_AES_KEY —— 检查后台是否开启了加密模式');
+          return json(res, 400, { error: 'expect encrypted body' });
+        }
+        const ok = verifySignature({
+          token: kfCfg.token,
+          timestamp: url.searchParams.get('timestamp') || '',
+          nonce: url.searchParams.get('nonce') || '',
+          msgSignature: url.searchParams.get('msg_signature') || '',
+          encrypt,
+        });
+        if (!ok) {
+          log('[kf] 消息签名校验失败');
+          return json(res, 401, { error: 'invalid signature' });
+        }
+        try {
+          const d = decryptMessage(encrypt, kfCfg.aesKey, kfCfg.corpId);
+          cb = parseKfCallback(parsePlainCallback(d.message));
+        } catch (err) {
+          log(`[kf] 解密失败：${err.message}`);
+          return json(res, 400, { error: 'decrypt failed' });
+        }
+      } else {
+        cb = parseKfCallback(body);
+      }
+
       if (!cb.ok) {
         log(`[kf] 忽略回调：${cb.error}`);
         return json(res, 200, { ok: true, ignored: true });

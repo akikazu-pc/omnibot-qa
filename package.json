@@ -25,7 +25,8 @@
     "bot:setup": "node scripts/setup-bot.js",
     "bot:test": "node scripts/setup-bot.js --test",
     "bot:show": "node scripts/setup-bot.js --show",
-    "kf:setup": "node scripts/setup-bot.js --kf"
+    "kf:setup": "node scripts/setup-bot.js --kf",
+    "kf:check": "node scripts/check-webhook.js"
   },
   "keywords": [
     "wecom",
